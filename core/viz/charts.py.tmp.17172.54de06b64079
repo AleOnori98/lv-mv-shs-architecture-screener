@@ -1,0 +1,160 @@
+"""Altair charts and headroom bars for the results dashboard.
+
+All builders take the dataframes the workflow already produces (``cost_breakdown_table`` and
+the parsed SHS screening table) and return either an Altair chart or a small HTML snippet, so
+the Streamlit page stays thin and these stay unit-testable without a running app.
+"""
+from __future__ import annotations
+
+import math
+from typing import Any, Dict, Iterable, Optional
+
+import altair as alt
+import pandas as pd
+
+from .tables import NPC_COMPONENTS
+
+
+def npc_breakdown_chart(cost_breakdown_table: pd.DataFrame, recommended: str,
+                        label_map: Dict[str, str], feasible_ids: Iterable[str]) -> alt.Chart:
+    """Stacked bar of NPC contributions for the **feasible** candidates, recommended one starred."""
+    feasible = list(feasible_ids)
+    present = [c for c in NPC_COMPONENTS if c in cost_breakdown_table.columns]
+    df = cost_breakdown_table[cost_breakdown_table["candidate_id"].isin(feasible)].melt(
+        id_vars="candidate_id", value_vars=present, var_name="component", value_name="cost",
+    )
+    df = df[df["cost"] != 0.0]
+    df["component"] = df["component"].map(NPC_COMPONENTS)
+
+    def _label(key: str) -> str:
+        return ("⭐ " if key == recommended else "") + label_map.get(key, key)
+
+    df["candidate"] = df["candidate_id"].map(_label)
+    order = [_label(k) for k in label_map if k in feasible]
+    return (
+        alt.Chart(df)
+        .mark_bar()
+        .encode(
+            x=alt.X("candidate:N", sort=order, title=None),
+            y=alt.Y("cost:Q", title="NPC contribution", stack=True),
+            color=alt.Color("component:N", title="Cost component",
+                            sort=list(NPC_COMPONENTS.values())),
+            tooltip=[alt.Tooltip("candidate:N"), alt.Tooltip("component:N"),
+                     alt.Tooltip("cost:Q", format=",.0f")],
+        )
+        .properties(height=360)
+    )
+
+
+def npc_share_chart(components_df: pd.DataFrame) -> Optional[alt.Chart]:
+    """Donut of one candidate's NPC composition (from :func:`core.viz.tables.npc_components`)."""
+    if components_df is None or components_df.empty:
+        return None
+    return (
+        alt.Chart(components_df)
+        .mark_arc(innerRadius=55)
+        .encode(
+            theta=alt.Theta("npc:Q", stack=True),
+            color=alt.Color("component:N", title=None, sort=list(NPC_COMPONENTS.values())),
+            tooltip=[alt.Tooltip("component:N"), alt.Tooltip("npc:Q", format=",.0f"),
+                     alt.Tooltip("share_%:Q", title="share %")],
+        )
+        .properties(height=260)
+    )
+
+
+def shs_decision_chart(screening_df: pd.DataFrame) -> Optional[alt.Chart]:
+    """Horizontal bars of the economic margin (avoided grid cost − SHS NPC) per leaf branch.
+
+    A positive margin means stand-alone is cheaper (selected, green); negative means the grid
+    is cheaper (kept, grey). Candidates blocked before costing have no margin and are omitted.
+    Returns ``None`` when nothing has a numeric margin.
+    """
+    d = screening_df[screening_df["margin"].notna()]
+    if d.empty:
+        return None
+    return (
+        alt.Chart(d)
+        .mark_bar()
+        .encode(
+            x=alt.X("margin:Q", title="Avoided grid cost − SHS NPC   (> 0 ⇒ stand-alone cheaper)"),
+            y=alt.Y("cluster_id:N", sort="-x", title="Candidate leaf branch"),
+            color=alt.Color(
+                "outcome:N", title="Decision",
+                scale=alt.Scale(domain=["selected", "kept"], range=["#2ca02c", "#6b7280"]),
+            ),
+            tooltip=[alt.Tooltip("cluster_id:N", title="branch"),
+                     alt.Tooltip("n_customers:Q", title="customers"),
+                     alt.Tooltip("shs_npc:Q", title="SHS NPC", format=",.0f"),
+                     alt.Tooltip("avoided_cost:Q", title="avoided", format=",.0f"),
+                     alt.Tooltip("margin:Q", format=",.0f"),
+                     alt.Tooltip("flags:N", title="diagnostics")],
+        )
+        .properties(height=alt.Step(18))
+    )
+
+
+# --------------------------------------------------------------------------------------------
+# Headroom bars: how much of an enforced electrical limit a candidate consumes at the horizon.
+# --------------------------------------------------------------------------------------------
+
+def _headroom_color(util: Optional[float]) -> str:
+    if util is None:
+        return "#6b7280"
+    if util >= 1.0:
+        return "#d62728"   # at or over the limit (violation)
+    if util >= 0.85:
+        return "#f28e2b"
+    if util >= 0.70:
+        return "#f2b701"
+    return "#2ca02c"
+
+
+def _bar(label: str, text: str, util: Optional[float]) -> str:
+    width = 100.0 if util is None else max(0.0, min(util, 1.0)) * 100.0
+    color = _headroom_color(util)
+    warn = " ⚠" if (util is not None and util >= 1.0) else ""
+    return (
+        '<div style="margin:6px 0;">'
+        '<div style="display:flex;justify-content:space-between;font-size:0.8rem;opacity:0.9;">'
+        f'<span>{label}</span><span><b>{text}{warn}</b></span></div>'
+        '<div style="background:#2a2a2a;border-radius:4px;height:10px;overflow:hidden;">'
+        f'<div style="width:{width:.0f}%;height:100%;background:{color};"></div></div></div>'
+    )
+
+
+def _finite(x: Any) -> bool:
+    try:
+        return x is not None and not math.isnan(float(x))
+    except (TypeError, ValueError):
+        return False
+
+
+def case_headroom_html(outcome, constraints: Dict[str, Any]) -> str:
+    """HTML headroom bars for one candidate's binding (horizon) power-flow outcome.
+
+    Voltage is a *floor* limit (fraction of the permitted drop from 1.0 pu that is used);
+    line and transformer loading are *ceiling* limits (value / limit). Bars only appear for
+    quantities the candidate actually has (e.g. no transformer bar for a pure-LV candidate).
+    """
+    if outcome is None:
+        return ""
+    v_min = float(constraints.get("voltage_min_pu", 0.90))
+    ll_max = float(constraints.get("max_line_loading_percent", 100.0))
+    tl_max = float(constraints.get("max_transformer_loading_percent", 100.0))
+    bars = []
+
+    v = outcome.min_vm_pu
+    if _finite(v):
+        util = (1.0 - float(v)) / (1.0 - v_min) if (1.0 - v_min) > 0 else None
+        bars.append(_bar(f"Min voltage (≥ {v_min:.2f} pu)", f"{float(v):.3f} pu", util))
+
+    ll = outcome.max_line_loading_percent
+    if _finite(ll):
+        bars.append(_bar(f"Max line loading (≤ {ll_max:.0f}%)", f"{float(ll):.0f}%", float(ll) / ll_max if ll_max else None))
+
+    tl = outcome.max_trafo_loading_percent
+    if _finite(tl) and float(tl) > 0:
+        bars.append(_bar(f"Max transformer loading (≤ {tl_max:.0f}%)", f"{float(tl):.0f}%", float(tl) / tl_max if tl_max else None))
+
+    return "".join(bars)

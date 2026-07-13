@@ -1,0 +1,10 @@
+{
+"type": "FeatureCollection",
+"name": "roads_example",
+"crs": { "type": "name", "properties": { "name": "urn:ogc:def:crs:OGC:1.3:CRS84" } },
+"features": [
+{ "type": "Feature", "properties": { "road_id": "trunk" }, "geometry": { "type": "LineString", "coordinates": [ [ 32.5825, 0.3476 ], [ 32.583038996624026, 0.348138986704995 ], [ 32.583577993248042, 0.348677973409989 ], [ 32.58285933108268, 0.351193244699964 ], [ 32.581152508439956, 0.353888178224937 ], [ 32.580703344586603, 0.355325476104923 ] ] } },
+{ "type": "Feature", "properties": { "road_id": "spur_inst" }, "geometry": { "type": "LineString", "coordinates": [ [ 32.581152508439956, 0.353888178224937 ], [ 32.580703344586603, 0.355325476104923 ] ] } },
+{ "type": "Feature", "properties": { "road_id": "spur_sparse" }, "geometry": { "type": "LineString", "coordinates": [ [ 32.583577993248042, 0.348677973409989 ], [ 32.586991638533497, 0.348947466762487 ], [ 32.591123945984315, 0.349396622349982 ], [ 32.594627424040446, 0.349845777937478 ] ] } }
+]
+}

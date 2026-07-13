@@ -1,0 +1,3 @@
+conductor_id,voltage_level,r_ohm_per_km,x_ohm_per_km,max_i_ka,cost_per_m,phase_count,rank
+MV_AL_35,MV,0.87,0.4,0.14,10.0,3,1
+MV_AL_70,MV,0.44,0.38,0.22,15.0,3,2

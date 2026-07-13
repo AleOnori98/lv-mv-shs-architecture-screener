@@ -1,0 +1,236 @@
+{
+  "mafa": {
+    "spatial": {
+      "n_customers": 240,
+      "total_peak_kw": 242.4,
+      "total_annual_mwh": 531.7,
+      "spread_median_m": 288.0,
+      "spread_p90_m": 570.0,
+      "spread_max_m": 851.0,
+      "hull_area_km2": 0.846,
+      "density_per_km2": 284.0,
+      "n_institutions": 13
+    },
+    "recommended": "D_MVLV_plus_standalone",
+    "cases": {
+      "A_full_LV": {
+        "feasible": false,
+        "npc_total": 182229.0,
+        "grid_capex": 182229.0,
+        "components": {
+          "lv_line_cost": 100627.0,
+          "mv_line_cost": 0.0,
+          "pole_cost": 38402.0,
+          "transformer_cost": 0.0,
+          "connection_metering_cost": 43200.0,
+          "standalone_npc": 0.0,
+          "loss_pv_cost": 0.0
+        },
+        "n_grid": 240,
+        "n_standalone": 0,
+        "n_transformers": 0,
+        "n_zones": 0,
+        "lv_length_m": 7741.0,
+        "mv_length_m": 0.0,
+        "n_poles": 211,
+        "min_vm_pu": null,
+        "max_line_pct": null,
+        "max_trafo_pct": null
+      },
+      "B_LV_plus_standalone": {
+        "feasible": false,
+        "npc_total": 177811.0,
+        "grid_capex": 155215.0,
+        "components": {
+          "lv_line_cost": 83043.0,
+          "mv_line_cost": 0.0,
+          "pole_cost": 32032.0,
+          "transformer_cost": 0.0,
+          "connection_metering_cost": 40140.0,
+          "standalone_npc": 22596.0,
+          "loss_pv_cost": 0.0
+        },
+        "n_grid": 223,
+        "n_standalone": 17,
+        "n_transformers": 0,
+        "n_zones": 0,
+        "lv_length_m": 6388.0,
+        "mv_length_m": 0.0,
+        "n_poles": 176,
+        "min_vm_pu": null,
+        "max_line_pct": null,
+        "max_trafo_pct": null
+      },
+      "C_MVLV": {
+        "feasible": true,
+        "npc_total": 470641.0,
+        "grid_capex": 330841.0,
+        "components": {
+          "lv_line_cost": 77442.0,
+          "mv_line_cost": 46647.0,
+          "pole_cost": 40222.0,
+          "transformer_cost": 123330.0,
+          "connection_metering_cost": 43200.0,
+          "standalone_npc": 0.0,
+          "loss_pv_cost": 139800.0
+        },
+        "n_grid": 240,
+        "n_standalone": 0,
+        "n_transformers": 9,
+        "n_zones": 9,
+        "lv_length_m": 7869.0,
+        "mv_length_m": 3262.0,
+        "n_poles": 221,
+        "min_vm_pu": 0.944,
+        "max_line_pct": 93.0,
+        "max_trafo_pct": 72.0
+      },
+      "D_MVLV_plus_standalone": {
+        "feasible": true,
+        "npc_total": 460834.0,
+        "grid_capex": 294682.0,
+        "components": {
+          "lv_line_cost": 75881.0,
+          "mv_line_cost": 41929.0,
+          "pole_cost": 31122.0,
+          "transformer_cost": 105430.0,
+          "connection_metering_cost": 40320.0,
+          "standalone_npc": 24485.0,
+          "loss_pv_cost": 141666.0
+        },
+        "n_grid": 224,
+        "n_standalone": 16,
+        "n_transformers": 7,
+        "n_zones": 7,
+        "lv_length_m": 6062.0,
+        "mv_length_m": 2932.0,
+        "n_poles": 171,
+        "min_vm_pu": 0.938,
+        "max_line_pct": 93.0,
+        "max_trafo_pct": 66.0
+      }
+    },
+    "total_customers": 240,
+    "grid_coverage_pct": 93.3,
+    "shs_coverage_pct": 6.7,
+    "npc_per_customer": 1920.0,
+    "runtime_s": 102.8
+  },
+  "nga_dense": {
+    "spatial": {
+      "n_customers": 240,
+      "total_peak_kw": 231.2,
+      "total_annual_mwh": 417.8,
+      "spread_median_m": 128.0,
+      "spread_p90_m": 202.0,
+      "spread_max_m": 255.0,
+      "hull_area_km2": 0.107,
+      "density_per_km2": 2250.0,
+      "n_institutions": 14
+    },
+    "recommended": "C_MVLV",
+    "cases": {
+      "A_full_LV": {
+        "feasible": false,
+        "npc_total": 73033.0,
+        "grid_capex": 73033.0,
+        "components": {
+          "lv_line_cost": 20369.0,
+          "mv_line_cost": 0.0,
+          "pole_cost": 9464.0,
+          "transformer_cost": 0.0,
+          "connection_metering_cost": 43200.0,
+          "standalone_npc": 0.0,
+          "loss_pv_cost": 0.0
+        },
+        "n_grid": 240,
+        "n_standalone": 0,
+        "n_transformers": 0,
+        "n_zones": 0,
+        "lv_length_m": 1567.0,
+        "mv_length_m": 0.0,
+        "n_poles": 52,
+        "min_vm_pu": null,
+        "max_line_pct": null,
+        "max_trafo_pct": null
+      },
+      "B_LV_plus_standalone": {
+        "feasible": false,
+        "npc_total": 73033.0,
+        "grid_capex": 73033.0,
+        "components": {
+          "lv_line_cost": 20369.0,
+          "mv_line_cost": 0.0,
+          "pole_cost": 9464.0,
+          "transformer_cost": 0.0,
+          "connection_metering_cost": 43200.0,
+          "standalone_npc": 0.0,
+          "loss_pv_cost": 0.0
+        },
+        "n_grid": 240,
+        "n_standalone": 0,
+        "n_transformers": 0,
+        "n_zones": 0,
+        "lv_length_m": 1567.0,
+        "mv_length_m": 0.0,
+        "n_poles": 52,
+        "min_vm_pu": null,
+        "max_line_pct": null,
+        "max_trafo_pct": null
+      },
+      "C_MVLV": {
+        "feasible": true,
+        "npc_total": 272977.0,
+        "grid_capex": 150888.0,
+        "components": {
+          "lv_line_cost": 28826.0,
+          "mv_line_cost": 1588.0,
+          "pole_cost": 10374.0,
+          "transformer_cost": 66900.0,
+          "connection_metering_cost": 43200.0,
+          "standalone_npc": 0.0,
+          "loss_pv_cost": 122089.0
+        },
+        "n_grid": 240,
+        "n_standalone": 0,
+        "n_transformers": 3,
+        "n_zones": 3,
+        "lv_length_m": 1558.0,
+        "mv_length_m": 111.0,
+        "n_poles": 57,
+        "min_vm_pu": 0.944,
+        "max_line_pct": 98.0,
+        "max_trafo_pct": 76.0
+      },
+      "D_MVLV_plus_standalone": {
+        "feasible": true,
+        "npc_total": 272977.0,
+        "grid_capex": 150888.0,
+        "components": {
+          "lv_line_cost": 28826.0,
+          "mv_line_cost": 1588.0,
+          "pole_cost": 10374.0,
+          "transformer_cost": 66900.0,
+          "connection_metering_cost": 43200.0,
+          "standalone_npc": 0.0,
+          "loss_pv_cost": 122089.0
+        },
+        "n_grid": 240,
+        "n_standalone": 0,
+        "n_transformers": 3,
+        "n_zones": 3,
+        "lv_length_m": 1558.0,
+        "mv_length_m": 111.0,
+        "n_poles": 57,
+        "min_vm_pu": 0.944,
+        "max_line_pct": 98.0,
+        "max_trafo_pct": 76.0
+      }
+    },
+    "total_customers": 240,
+    "grid_coverage_pct": 100.0,
+    "shs_coverage_pct": 0.0,
+    "npc_per_customer": 1137.0,
+    "runtime_s": 21.5
+  }
+}

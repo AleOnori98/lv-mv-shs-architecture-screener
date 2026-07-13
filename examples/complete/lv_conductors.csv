@@ -1,0 +1,5 @@
+conductor_id,voltage_level,r_ohm_per_km,x_ohm_per_km,max_i_ka,cost_per_m,phase_count,rank
+LV_ABC_25,LV,1.2,0.09,0.1,7.0,3,1
+LV_ABC_50,LV,0.64,0.085,0.16,10.0,3,2
+LV_ABC_95,LV,0.32,0.078,0.24,15.0,3,3
+LV_ABC_150,LV,0.21,0.075,0.32,22.0,3,4

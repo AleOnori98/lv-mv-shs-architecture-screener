@@ -1,0 +1,5 @@
+package_id,service_tier,max_peak_kw,annual_kwh,capex,lifetime_years,annual_om_fraction,replacement_fraction
+SHS_T1,1,0.2,300,240,8,0.045,0.55
+SHS_T2,2,0.45,800,520,8,0.045,0.55
+SHS_T3,3,1.1,2200,950,10,0.035,0.5
+SHS_T4,4,2.2,4000,2100,10,0.035,0.5

@@ -1,0 +1,2 @@
+source_id,latitude,longitude,source_type,lv_voltage_kv,mv_voltage_kv
+SRC0,11.922783,13.600744,grid_injection,0.4,11.0
