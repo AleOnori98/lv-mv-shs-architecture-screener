@@ -36,6 +36,30 @@ def test_mvlv_uses_explicit_mv_tree(mvp, inputs):
     assert hybrid.plan.mv_topology is not None
 
 
+def test_mvlv_has_single_slack_and_explicit_stepup(mvp):
+    """Case C is fed through ONE slack on the plant LV bus and an explicit step-up transformer;
+    the MV backbone sits below the sending voltage (a real drop, not the old flat 1.04 pu slack)."""
+    for cid in ("C_MVLV", "D_MVLV_plus_standalone"):
+        case = mvp.cases[cid]
+        if case.model is None:  # D can be empty if everyone goes stand-alone
+            continue
+        net = case.model.net
+        assert len(net.ext_grid) == 1
+        assert case.model.stepup_trafo_index is not None
+        assert "stepup_tx" in set(net.trafo["name"])
+        assert float(net.ext_grid.vm_pu.iloc[0]) <= 1.001  # honest sending voltage, not 1.04
+        mv_vm = net.res_bus.loc[net.bus["vn_kv"] > 1.0, "vm_pu"]
+        assert not mv_vm.empty and mv_vm.max() < 1.0  # MV energised only through the step-up
+
+
+def test_mvlv_records_transformer_count_search(mvp):
+    """The transformer count is chosen by a criterion and its search history is exposed."""
+    case = mvp.cases["C_MVLV"]
+    assert case.plan.clustering_criterion in {"voltage_cap", "distance_cap", "capacity"}
+    assert len(case.plan.mv_iterations) >= 1
+    assert case.n_transformers == len(case.plan.zones)
+
+
 def test_every_candidate_has_a_coincident_stress_outcome(mvp):
     """The coincident-peak (factor 1.0) stress PF is computed and exposed for every candidate."""
     for case in mvp.cases.values():

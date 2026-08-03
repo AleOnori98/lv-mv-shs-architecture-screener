@@ -57,6 +57,7 @@ def test_avoided_lv_cost_includes_service_drops_and_losses():
         "civil_logistics_multiplier": 1.2,
         "loss_load_factor": 0.3,
         "loss_value_per_kwh": 0.2,
+        "generation_lcoe_per_kwh": 0.25,
         "discount_rate": 0.08,
         "planning_horizon_years": 15,
     }
@@ -78,14 +79,18 @@ def test_avoided_lv_cost_includes_service_drops_and_losses():
             ]
         ),
         "params": params,
+        "annual_kwh_by_id": {"C1": 1000.0, "C2": 500.0},
+        "T": int(params["planning_horizon_years"]),
+        "discount": float(params["discount_rate"]),
     }
 
-    expected_without_loss = (
+    expected_base = (
         100.0  # branch cost (internal lines + entry edge)
         + 30.0 * 2.0 * 1.2  # service drops with cheapest LV conductor
         + 2 * (100.0 + 50.0)  # connection and metering
         + 3 * 120.0 * 1.2  # all subtree poles avoided
+        + cm.generation_present_value(1500.0, params)  # avoided grid generation for C1 + C2
     )
-    expected = expected_without_loss + cm.loss_present_value(1.0, params)
+    expected = expected_base + cm.loss_present_value(1.0, params)
 
     assert _avoided_lv_cost(cluster, ctx) == expected
