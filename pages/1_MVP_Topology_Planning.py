@@ -201,6 +201,31 @@ with pf_col.container(border=True):
              "SIZE and validate the network. The coincident-peak stress test always uses 1.0 (everyone at once).",
     )
 
+    st.markdown("**MV/LV transformer zoning (Case C)**")
+    _crit_opts = ["voltage_cap", "distance_cap", "capacity"]
+    _crit_default = str(cp.get("clustering_criterion", "voltage_cap"))
+    clustering_criterion = st.selectbox(
+        "Transformer-count criterion",
+        _crit_opts,
+        index=_crit_opts.index(_crit_default) if _crit_default in _crit_opts else 0,
+        help="voltage_cap: iterate the transformer count and let the power flow pick the MINIMUM that holds "
+             "the LV voltage drop (backtracked). distance_cap: complete-linkage clusters guaranteed ≤ max "
+             "diameter. capacity: legacy greedy packing. All three respect the transformer kVA cap.",
+    )
+    max_cluster_diameter_m = st.number_input(
+        "Max cluster diameter [m] (distance_cap)", 100.0, 3000.0,
+        float(cp.get("max_cluster_diameter_m", 500.0)), 50.0,
+    )
+    max_transformers = st.number_input(
+        "Max transformers (safety cap)", 1, 50, int(cp.get("max_transformers", 12)), 1,
+    )
+    source_vm_pu = st.number_input(
+        "Sending voltage at plant slack [pu]", 0.95, 1.10,
+        float(cp.get("source_vm_pu", 1.0)), 0.01, format="%.2f",
+        help="Slack voltage on the plant LV bus; an explicit step-up transformer produces the MV drop "
+             "(replaces the earlier fixed 1.04 pu slack placed directly on the MV bus).",
+    )
+
 eng = {
     # Topology heuristics
     "max_user_connection_radius_m": max_user_connection_radius_m,
@@ -217,6 +242,11 @@ eng = {
     "max_line_loading_percent": max_line_loading_percent,
     "max_transformer_loading_percent": max_transformer_loading_percent,
     "coincidence_factor": coincidence_factor,
+    # MV/LV transformer zoning (Case C)
+    "clustering_criterion": clustering_criterion,
+    "max_cluster_diameter_m": max_cluster_diameter_m,
+    "max_transformers": max_transformers,
+    "source_vm_pu": source_vm_pu,
 }
 
 # --------------------------------------------------------------------------
