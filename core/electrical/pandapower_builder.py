@@ -24,6 +24,7 @@ class PPModel:
     zone_bus_by_pole: Dict[str, Dict[int, int]] = field(default_factory=dict)
     line_index_by_id: Dict[str, int] = field(default_factory=dict)
     trafo_index_by_zone: Dict[str, int] = field(default_factory=dict)
+    stepup_trafo_index: Optional[int] = None
     lv_line_ids: List[str] = field(default_factory=list)
     mv_line_ids: List[str] = field(default_factory=list)
     total_load_kw: float = 0.0
@@ -125,26 +126,28 @@ def build_mvlv_net(
     mv_kv: float,
     horizon_years: int,
     apply_growth: bool,
+    stepup_transformer: Dict[str, Any],
     coincidence_factor: float = 1.0,
-    source_vm_pu: float = 1.04,
+    source_vm_pu: float = 1.0,
 ) -> PPModel:
-    """LV core fed from source + MV trunk to transformer service zones.
+    """LV core + MV trunk to transformer service zones, fed through an explicit step-up.
 
-    ``plan`` is an :class:`core.topology.mvlv_service_zones.MVLVPlan`. The source/slack is set
-    at ``source_vm_pu`` (a realistic high sending-end voltage) to offset the downstream MV-line
-    and transformer voltage drop across the service zones.
+    ``plan`` is an :class:`core.topology.mvlv_service_zones.MVLVPlan`. A single slack
+    (``ext_grid`` at ``source_vm_pu``, the honest sending voltage) sits on the plant LV bus;
+    an explicit **step-up transformer** lifts it to the MV backbone, which then steps back down
+    at each service zone. This replaces the earlier MVP shortcut of a fixed 1.04 pu slack placed
+    directly on the MV bus with no step-up device.
     """
     net = pp.create_empty_network(name="MVLV")
     lookup = customer_lookup(customers_df)
     model = PPModel(net=net)
 
-    # --- Core LV (fed directly from the source at LV) ---
+    # --- Source LV bus (single slack) + optional LV core fed directly at LV ---
     core = plan.core_topology
     core_bus_by_pole: Dict[int, int] = {}
     if core is not None:
         for pid in core.pole_xy:
             core_bus_by_pole[int(pid)] = pp.create_bus(net, vn_kv=float(lv_kv), name=f"core_pole_{int(pid)}")
-        pp.create_ext_grid(net, bus=core_bus_by_pole[core.slack_pole_id], vm_pu=float(source_vm_pu), name="source")
         source_lv_bus = core_bus_by_pole[core.slack_pole_id]
         if core.edges_4326 is not None and not core.edges_4326.empty:
             for _, e in core.edges_4326.iterrows():
@@ -160,10 +163,13 @@ def build_mvlv_net(
                 model.total_load_kw += p_kw
         model.bus_by_pole.update(core_bus_by_pole)
     else:
-        # No core customers: still need a source MV bus reference.
-        source_lv_bus = None
+        # Full-settlement zoning (no LV core): a dedicated plant LV bus carries the slack.
+        source_lv_bus = pp.create_bus(net, vn_kv=float(lv_kv), name="source_lv")
 
-    # --- MV source bus ---
+    # The one and only slack: the plant LV bus at the sending voltage.
+    pp.create_ext_grid(net, bus=source_lv_bus, vm_pu=float(source_vm_pu), name="source")
+
+    # --- MV source bus (energised from the plant LV bus through the step-up transformer) ---
     mv_topology = getattr(plan, "mv_topology", None)
     if mv_topology is not None:
         for pid in mv_topology.pole_xy:
@@ -184,11 +190,22 @@ def build_mvlv_net(
                 model.mv_line_ids.append(mv_lid)
     else:
         mv_source_bus = pp.create_bus(net, vn_kv=float(mv_kv), name="mv_source")
-    # The MV bus is fed from the same source point (modelled as a slack at the sending voltage).
-    # When there is no LV core, this is the only slack; otherwise it is a second reference at the
-    # same source location (no explicit step-up transformer is modelled — an MVP simplification).
-    pp.create_ext_grid(net, bus=mv_source_bus, vm_pu=float(source_vm_pu),
-                       name="source" if source_lv_bus is None else "mv_source_slack")
+
+    # --- Explicit step-up transformer: plant LV bus -> MV backbone ---
+    su = stepup_transformer
+    model.stepup_trafo_index = pp.create_transformer_from_parameters(
+        net,
+        hv_bus=mv_source_bus,
+        lv_bus=source_lv_bus,
+        sn_mva=float(su["sn_kva"]) / 1000.0,
+        vn_hv_kv=float(su.get("vn_hv_kv", mv_kv)),
+        vn_lv_kv=float(su.get("vn_lv_kv", lv_kv)),
+        vk_percent=float(su["vk_percent"]),
+        vkr_percent=float(su["vkr_percent"]),
+        pfe_kw=float(su.get("pfe_kw", 0.0)),
+        i0_percent=float(su.get("i0_percent", 0.0)),
+        name="stepup_tx",
+    )
 
     # --- Service zones: MV line -> transformer -> local LV tree ---
     for zone in plan.zones:
@@ -246,5 +263,11 @@ def build_mvlv_net(
             if p_kw > 0:
                 pp.create_load(net, bus=zbus_by_pole[int(pid)], p_mw=p_kw / 1000.0, q_mvar=q_kw / 1000.0)
                 model.total_load_kw += p_kw
+
+    # Single-slack invariant: exactly one reference (the plant LV bus); the MV layer is
+    # energised only through the step-up transformer, never by a second ext_grid.
+    n_slack = int(len(net.ext_grid))
+    if n_slack != 1:
+        raise ValueError(f"build_mvlv_net expected exactly one slack (ext_grid); got {n_slack}")
 
     return model

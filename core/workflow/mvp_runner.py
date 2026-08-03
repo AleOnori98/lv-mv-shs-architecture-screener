@@ -12,7 +12,14 @@ import pandas as pd
 from core.io.load_inputs import customers_to_engine_gdf
 from core.topology.lv_topology import build_lv_topology
 from core.topology.branch_detection import Cluster, detect_lv_subtrees, subtree_clusters
-from core.topology.mvlv_service_zones import build_mvlv_plan, partition_service_zones
+from core.topology.mvlv_service_zones import (
+    _coords_and_ids,
+    build_mvlv_plan,
+    build_stepup_spec,
+    partition_zones,
+    suggest_zone_start,
+    zone_apparent_power_kva,
+)
 from core.electrical.pandapower_builder import build_lv_net, build_mvlv_net
 from core.electrical.conductor_sizing import size_conductors, critical_lv_lines
 from core.electrical.validation import run_powerflow
@@ -129,6 +136,9 @@ def _avoided_grid_cost(cluster: Cluster, ctx, *, include_losses: bool) -> float:
       + service-drop reconnection proxy (drop metres priced with the cheapest LV conductor)
       + avoided connection/metering for the subtree's customers
       + avoided poles dedicated to the subtree (the boundary pole stays, hence is excluded)
+      + present value of avoided grid GENERATION for the subtree's customers (they no longer draw
+        mini-grid energy once off-grid) — credited in BOTH screens so the gate matches the true
+        total-NPC break-even (generation dominates NPC and was previously omitted)
       [+ present value of avoided branch I^2R losses — LV screen only].
     """
     params = ctx["params"]
@@ -137,20 +147,23 @@ def _avoided_grid_cost(cluster: Cluster, ctx, *, include_losses: bool) -> float:
     service_drop_cost = float(cluster.metadata.get("service_drop_m", 0.0)) * float(cheapest_lv["cost_per_m"]) * mult
     conn = cm.connection_capex(cluster.n_customers, params)
     pole_cost = cm.pole_capex(len(cluster.pole_ids), params["pole_cost"], mult)
-    avoided = cluster.branch_cost + service_drop_cost + conn + pole_cost
+    generation_pv = _generation_npc(ctx, cluster.customer_ids)
+    avoided = cluster.branch_cost + service_drop_cost + conn + pole_cost + generation_pv
     if include_losses:
         avoided += cm.loss_present_value(getattr(cluster, "branch_losses_kw", 0.0), params)
     return float(avoided)
 
 
 def _avoided_lv_cost(cluster: Cluster, ctx) -> float:
-    """Case B: includes avoided branch-loss PV (sliced from the solved Full-LV power flow)."""
+    """Case B: avoided grid generation PV + avoided branch-loss PV (sliced from the solved
+    Full-LV power flow)."""
     return _avoided_grid_cost(cluster, ctx, include_losses=True)
 
 
 def _avoided_mvlv_subtree_cost(cluster: Cluster, ctx) -> float:
-    """Case D: conservative — no avoided losses, and the zone transformer / MV service drop are
-    credited only via the rebuild (an evacuated zone is simply not re-created), never per subtree."""
+    """Case D: avoided grid generation PV is credited (as in Case B). Still conservative on the
+    electrical side — branch losses are not sliced per subtree, and the zone transformer / MV
+    service drop are credited only via the rebuild (an evacuated zone is simply not re-created)."""
     return _avoided_grid_cost(cluster, ctx, include_losses=False)
 
 
@@ -260,25 +273,29 @@ def _run_lv_standalone(ctx, full_res: CaseResult, sa_customers, sa_assignments, 
 
 
 # ---------------------------------------------------------------------------
-# Case C — MV/LV service zones (full-settlement capacity-limited zoning)
+# Case C — MV/LV service zones (criterion-driven transformer count)
 # ---------------------------------------------------------------------------
 
-def _build_mvlv(ctx, grid_ids: List[str]) -> Dict[str, Any]:
-    """Partition grid customers into transformer zones, size LV per zone + MV trunk, validate.
+def _iter_record(n_zones: int, outcome, note: str) -> Dict[str, Any]:
+    """One row of the transformer-count search history (for logs / UI)."""
+    return {
+        "n_zones": int(n_zones),
+        "feasible": bool(outcome.feasible),
+        "converged": bool(outcome.converged),
+        "min_vm_pu": float(outcome.min_vm_pu),
+        "worst_dv_pu": (float(1.0 - outcome.min_vm_pu) if outcome.converged else float("nan")),
+        "bottleneck": outcome.active_bottleneck,
+        "note": note,
+    }
 
-    Returns the plan, sized conductors, chosen transformers and the horizon PF outcome.
+
+def _build_mvlv_at(ctx, groups: List[List[str]], stepup_spec: Dict[str, Any]) -> Dict[str, Any]:
+    """Build plan + per-zone LV sizing + MV-rank sweep + horizon PF for a FIXED partition.
+
+    The transformer count is whatever ``groups`` contains; the caller decides how ``groups``
+    was formed (capacity packing, distance-cap linkage, or a voltage-cap k-means attempt).
     """
     T, constraints = ctx["T"], ctx["constraints"]
-    crs_epsg = int(ctx["crs_meta"].get("projected_crs_epsg") or 32633)
-    # Cap zone load at the largest transformer's derated rating divided by the sizing safety
-    # factor, so even the biggest zone leaves headroom (avoids transformer overload at horizon).
-    max_derated = float((ctx["transformers"]["sn_kva"] * ctx["transformers"]["max_loading_percent"] / 100.0).max())
-    max_kva = max_derated / 1.2
-    groups = partition_service_zones(
-        grid_ids, ctx["gdf"], ctx["source"], crs_epsg, customers_df=ctx["customers"], horizon_years=T,
-        max_zone_radius_m=float(ctx["params"]["max_lv_zone_radius_m"]), max_zone_kva=max_kva,
-        max_zone_customers=int(ctx["params"]["max_zone_customers"]),
-    )
     plan = build_mvlv_plan(
         groups, ctx["gdf"], ctx["roads"], ctx["crs_meta"], ctx["source"], ctx["eng"],
         ctx["customers"], ctx["transformers"], horizon_years=T,
@@ -302,24 +319,126 @@ def _build_mvlv(ctx, grid_ids: List[str]) -> Dict[str, Any]:
             plan, ctx["customers"], core_conductor_by_line={}, zone_conductor_by_line=zone_cond,
             mv_conductor=mv_cond, transformer_by_zone=transformer_by_zone,
             lv_kv=ctx["lv_kv"], mv_kv=ctx["mv_kv"], horizon_years=T, apply_growth=True,
-            coincidence_factor=ctx["coincidence"],
+            stepup_transformer=stepup_spec, coincidence_factor=ctx["coincidence"],
+            source_vm_pu=ctx["source_vm_pu"],
         )
         final_outcome = run_powerflow(final_model, constraints)
         if final_outcome.feasible:
             break
 
+    return {"plan": plan, "zone_cond": zone_cond, "transformers": transformers_chosen,
+            "transformer_by_zone": transformer_by_zone, "mv_cond": mv_cond,
+            "model": final_model, "outcome": final_outcome}
+
+
+def _voltage_cap_search(ctx, grid_ids, crs_epsg, max_kva, max_transformers, stepup_spec, seed):
+    """Iterate the number of zones and let the power flow pick the MINIMUM that holds the cap.
+
+    ``run_powerflow`` feasibility already encodes the LV voltage cap (v_min >= voltage_min_pu,
+    i.e. dV <= 1 - voltage_min_pu) plus line/transformer loading, and treats Newton-Raphson
+    divergence as infeasible. Seed at a physically-motivated zone count, then backtrack to the
+    minimum feasible count (or climb to max_transformers if the seed is not enough).
+    """
+    T = ctx["T"]
+    coords, _ = _coords_and_ids(grid_ids, ctx["gdf"])
+    iterations: List[Dict[str, Any]] = []
+
+    def attempt(n_zones: int) -> Dict[str, Any]:
+        groups = partition_zones(
+            "voltage_cap", grid_ids, ctx["gdf"], ctx["source"], crs_epsg,
+            customers_df=ctx["customers"], horizon_years=T, max_zone_kva=max_kva,
+            max_zone_radius_m=float(ctx["params"]["max_lv_zone_radius_m"]),
+            max_zone_customers=int(ctx["params"]["max_zone_customers"]),
+            n_zones=int(n_zones), seed=seed,
+        )
+        return _build_mvlv_at(ctx, groups, stepup_spec)
+
+    k_seed = max(1, min(int(suggest_zone_start(coords, float(ctx["params"]["seed_diameter_m"]))), max_transformers))
+    best = attempt(k_seed)
+    iterations.append(_iter_record(len(best["plan"].zones), best["outcome"], "seed"))
+
+    if best["outcome"].feasible:
+        # Backtrack toward fewer zones; accept only strictly smaller feasible partitions.
+        target = len(best["plan"].zones) - 1
+        while target >= 1:
+            cand = attempt(target)
+            n = len(cand["plan"].zones)
+            iterations.append(_iter_record(n, cand["outcome"], "backtrack"))
+            if cand["outcome"].feasible and n < len(best["plan"].zones):
+                best = cand
+                target = n - 1
+            else:
+                break
+    else:
+        # Climb toward more zones until feasible or the safety cap is hit.
+        target = len(best["plan"].zones) + 1
+        while target <= max_transformers:
+            cand = attempt(target)
+            n = len(cand["plan"].zones)
+            iterations.append(_iter_record(n, cand["outcome"], "climb"))
+            best = cand
+            if cand["outcome"].feasible:
+                break
+            target = n + 1
+    return best, iterations
+
+
+def _build_mvlv(ctx, grid_ids: List[str]) -> Dict[str, Any]:
+    """Choose the transformer count by the active criterion, then size + validate the network.
+
+    Returns the plan, sized conductors, chosen step-down transformers, the plant step-up spec,
+    the design/stress PF outcomes and the transformer-count search history.
+    """
+    T = ctx["T"]
+    crs_epsg = int(ctx["crs_meta"].get("projected_crs_epsg") or 32633)
+    # Cap zone load at the largest transformer's derated rating over the sizing safety factor,
+    # so even the biggest zone leaves headroom (avoids transformer overload at horizon).
+    max_derated = float((ctx["transformers"]["sn_kva"] * ctx["transformers"]["max_loading_percent"] / 100.0).max())
+    max_kva = max_derated / 1.2
+    criterion = str(ctx["params"].get("clustering_criterion", "voltage_cap"))
+    max_transformers = int(ctx["params"].get("max_transformers", 12))
+    seed = 42
+
+    # Plant step-up sized on the whole settlement's coincident apparent power (may exceed the
+    # catalogue; it is a single project-procured unit, unlike the kVA-capped zone step-downs).
+    s_system_kva = zone_apparent_power_kva(list(grid_ids), ctx["customers"], T)
+    stepup_spec = build_stepup_spec(s_system_kva, ctx["transformers"], mv_kv=ctx["mv_kv"], lv_kv=ctx["lv_kv"])
+
+    if criterion == "voltage_cap":
+        best, iterations = _voltage_cap_search(ctx, grid_ids, crs_epsg, max_kva, max_transformers, stepup_spec, seed)
+    else:
+        groups = partition_zones(
+            criterion, grid_ids, ctx["gdf"], ctx["source"], crs_epsg,
+            customers_df=ctx["customers"], horizon_years=T, max_zone_kva=max_kva,
+            max_zone_radius_m=float(ctx["params"]["max_lv_zone_radius_m"]),
+            max_zone_customers=int(ctx["params"]["max_zone_customers"]),
+            max_cluster_diameter_m=float(ctx["params"]["max_cluster_diameter_m"]),
+            seed=seed,
+        )
+        if criterion == "distance_cap" and len(groups) > max_transformers:
+            raise ValueError(
+                f"The {float(ctx['params']['max_cluster_diameter_m']):.0f} m diameter cap requires "
+                f"{len(groups)} transformers, above the safety cap of {max_transformers}. Raise "
+                f"'max_transformers' or relax the diameter cap."
+            )
+        best = _build_mvlv_at(ctx, groups, stepup_spec)
+        iterations = [_iter_record(len(best["plan"].zones), best["outcome"], criterion)]
+
+    plan = best["plan"]
+    plan.clustering_criterion = criterion
+    plan.mv_iterations = iterations
+
     # Coincident-peak stress: same network + chosen MV conductor, every customer at horizon peak
     # simultaneously (factor 1.0). Reported alongside the design outcome, not used to gate feasibility.
     stress_model = build_mvlv_net(
-        plan, ctx["customers"], core_conductor_by_line={}, zone_conductor_by_line=zone_cond,
-        mv_conductor=mv_cond, transformer_by_zone=transformer_by_zone,
+        plan, ctx["customers"], core_conductor_by_line={}, zone_conductor_by_line=best["zone_cond"],
+        mv_conductor=best["mv_cond"], transformer_by_zone=best["transformer_by_zone"],
         lv_kv=ctx["lv_kv"], mv_kv=ctx["mv_kv"], horizon_years=T, apply_growth=True,
-        coincidence_factor=1.0,
+        stepup_transformer=stepup_spec, coincidence_factor=1.0, source_vm_pu=ctx["source_vm_pu"],
     )
-    stress_outcome = run_powerflow(stress_model, constraints)
-    return {"plan": plan, "zone_cond": zone_cond, "transformers": transformers_chosen,
-            "mv_cond": mv_cond, "model": final_model, "outcome": final_outcome,
-            "stress_model": stress_model, "stress_outcome": stress_outcome}
+    stress_outcome = run_powerflow(stress_model, ctx["constraints"])
+    return {**best, "stepup": stepup_spec, "stress_model": stress_model,
+            "stress_outcome": stress_outcome, "iterations": iterations}
 
 
 def _run_mvlv(ctx, grid_ids: List[str], *, cid: str = "C_MVLV", architecture: str = "MV/LV",
@@ -347,8 +466,16 @@ def _run_mvlv(ctx, grid_ids: List[str], *, cid: str = "C_MVLV", architecture: st
     plan, zone_cond, transformers_chosen = built["plan"], built["zone_cond"], built["transformers"]
     mv_cond, final_model, final_outcome = built["mv_cond"], built["model"], built["outcome"]
     stress_model, stress_outcome = built["stress_model"], built["stress_outcome"]
-    _log(ctx["log"], "mvlv_zone", cid, "partition", "capacity-limited service zones",
+    stepup = built["stepup"]
+    criterion = plan.clustering_criterion or "voltage_cap"
+    _log(ctx["log"], "mvlv_zone", cid, "partition", f"{criterion} → {len(plan.zones)} transformer zones",
          "n_zones", f"{len(plan.zones)} over {len(grid_ids)} customers")
+    for it in built["iterations"]:
+        _log(ctx["log"], "mv_transformer_count", cid, f"k={it['n_zones']}",
+             "feasible" if it["feasible"] else ("diverged" if not it["converged"] else "infeasible"),
+             it["bottleneck"], "worst_dv_pu", f"{it['worst_dv_pu']:.4f}", threshold=it["note"])
+    _log(ctx["log"], "transformer_sizing", cid, "stepup", f"plant step-up {stepup['sn_kva']:.0f} kVA",
+         "system coincident S × margin, may exceed catalogue", "sn_kva", f"{stepup['sn_kva']}")
     for tx in transformers_chosen:
         _log(ctx["log"], "transformer_sizing", cid, tx["zone_id"], f"select {tx['transformer_id']}",
              "smallest rating covering horizon S", "sn_kva", f"{tx['sn_kva']}")
@@ -359,6 +486,7 @@ def _run_mvlv(ctx, grid_ids: List[str], *, cid: str = "C_MVLV", architecture: st
         plan, ctx["customers"], core_conductor_by_line={}, zone_conductor_by_line=zone_cond,
         mv_conductor=mv_cond, transformer_by_zone={z["zone_id"]: z["transformer_spec"] for z in plan.zones},
         lv_kv=ctx["lv_kv"], mv_kv=ctx["mv_kv"], horizon_years=T, apply_growth=False,
+        stepup_transformer=stepup, source_vm_pu=ctx["source_vm_pu"],
         coincidence_factor=ctx["coincidence"],
     )
     now = run_powerflow(now_model, ctx["constraints"])
@@ -378,7 +506,7 @@ def _run_mvlv(ctx, grid_ids: List[str], *, cid: str = "C_MVLV", architecture: st
     cost.mv_line_cost = cm.line_cost({lid: mv_cond for lid in mv_len_by_line}, mv_len_by_line, ctx["params"]["civil_logistics_multiplier"])
     n_poles = sum(len(z["topology"].pole_xy) for z in plan.zones)
     cost.pole_cost = cm.pole_capex(n_poles, ctx["params"]["pole_cost"], ctx["params"]["civil_logistics_multiplier"])
-    cost.transformer_cost = cm.transformer_capex(transformers_chosen)
+    cost.transformer_cost = cm.transformer_capex(transformers_chosen + [stepup])
     service_drop_total = sum(
         float(z["topology"].service_drop_m.get(c, 0.0))
         for z in plan.zones for c in z["topology"].served_customer_ids
@@ -620,7 +748,8 @@ def run_simplified_mvp(
     # Engineering overrides for shared keys.
     for k in ("planning_horizon_years", "discount_rate", "voltage_min_pu", "voltage_max_pu",
               "max_line_loading_percent", "max_transformer_loading_percent",
-              "coincidence_factor", "generation_lcoe_per_kwh"):
+              "coincidence_factor", "generation_lcoe_per_kwh",
+              "clustering_criterion", "max_cluster_diameter_m", "max_transformers", "source_vm_pu"):
         if k in eng and eng[k] is not None:
             params[k] = eng[k]
     T = int(params["planning_horizon_years"])
@@ -644,6 +773,7 @@ def run_simplified_mvp(
         "mv_conductors": mv_conductors, "transformers": transformers, "packages": standalone_packages,
         "lv_kv": float(source.get("lv_voltage_kv", 0.4)), "mv_kv": float(source.get("mv_voltage_kv", 11.0)),
         "coincidence": float(params["coincidence_factor"]), "annual_kwh_by_id": annual_kwh_by_id,
+        "source_vm_pu": float(params["source_vm_pu"]),
         "log": log,
     }
 

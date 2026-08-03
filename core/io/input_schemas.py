@@ -189,15 +189,39 @@ COST_PARAMETER_DEFAULTS: Dict[str, float] = {
     # MV/LV service-zone partition (Case C): max LV radius and customers per transformer zone.
     "max_lv_zone_radius_m": 250.0,
     "max_zone_customers": 60,
+    # MV transformer-count criterion (Case C). "voltage_cap": iterate the number of zones and
+    # let the power flow pick the minimum that holds the LV voltage drop (1 - voltage_min_pu);
+    # "distance_cap": complete-linkage clusters guaranteed <= max_cluster_diameter_m; "capacity":
+    # legacy greedy farthest-first packing. All three respect the transformer kVA cap.
+    "clustering_criterion": "voltage_cap",
+    "max_cluster_diameter_m": 500.0,
+    "max_transformers": 12,
+    "seed_diameter_m": 2000.0,
+    # Sending voltage at the plant LV slack; an explicit step-up transformer produces the real
+    # drop onto the MV backbone (replaces the earlier fixed 1.04 pu slack on the MV bus).
+    "source_vm_pu": 1.0,
 }
 
+# Non-numeric parameters passed through verbatim by ``normalize_cost_parameters``.
+_STRING_PARAMETERS = frozenset({"clustering_criterion"})
+_ALLOWED_CLUSTERING_CRITERIA = frozenset({"voltage_cap", "distance_cap", "capacity"})
 
-def normalize_cost_parameters(params: Dict[str, Any]) -> Dict[str, float]:
+
+def normalize_cost_parameters(params: Dict[str, Any]) -> Dict[str, Any]:
     out = dict(COST_PARAMETER_DEFAULTS)
     for key, value in (params or {}).items():
-        if key in out and value is not None and str(value).strip() != "":
-            try:
-                out[key] = float(value)
-            except (TypeError, ValueError):
-                pass
+        if key not in out or value is None or str(value).strip() == "":
+            continue
+        if key in _STRING_PARAMETERS:
+            out[key] = str(value).strip()
+            continue
+        try:
+            out[key] = float(value)
+        except (TypeError, ValueError):
+            pass
+    crit = str(out.get("clustering_criterion", "voltage_cap"))
+    if crit not in _ALLOWED_CLUSTERING_CRITERIA:
+        raise ValueError(
+            f"clustering_criterion must be one of {sorted(_ALLOWED_CLUSTERING_CRITERIA)}; got {crit!r}"
+        )
     return out

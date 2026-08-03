@@ -14,15 +14,22 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import geopandas as gpd
 import networkx as nx
+import numpy as np
 import pandas as pd
+from scipy.cluster.hierarchy import fcluster, linkage
+from scipy.cluster.vq import kmeans2
+from scipy.spatial import ConvexHull, QhullError
+from scipy.spatial.distance import pdist
 from shapely.geometry import Point
 from shapely.ops import nearest_points
 
 from .lv_topology import LVTopology, build_lv_topology
+
+_HULL_MIN_POINTS = 500  # above this cluster size, reduce to convex-hull vertices before pdist
 
 
 @dataclass
@@ -33,6 +40,8 @@ class MVLVPlan:
     core_customer_ids: List[str] = field(default_factory=list)
     zone_customer_ids: List[str] = field(default_factory=list)
     mv_topology: Optional[LVTopology] = None
+    clustering_criterion: str = ""
+    mv_iterations: List[Dict[str, Any]] = field(default_factory=list)
 
 
 def _customer_kva(customers_df: pd.DataFrame, horizon_years: int) -> Dict[str, float]:
@@ -102,6 +111,268 @@ def partition_service_zones(
             zkva += kva.get(c, 0.0)
         zones.append(sorted(members))
     return zones
+
+
+# =============================================================================
+# Criterion-driven partitioning (distance cap / voltage cap)
+#
+# Pure geometry: these never decide how many transformers to build. The k-search
+# for the voltage cap lives in the workflow runner (``mvp_runner._build_mvlv``),
+# mirroring the reference split between partitioning and the reinforcement loop.
+# All three criteria funnel through ``enforce_kva_cap`` so the transformer kVA
+# cap (largest procurable rating) is preserved regardless of how clusters form.
+# =============================================================================
+def _coords_and_ids(customer_ids: List[str], customers_engine_gdf: gpd.GeoDataFrame) -> Tuple[np.ndarray, List[str]]:
+    """(N, 2) projected-metre coordinates and the aligned customer-id list."""
+    wanted = set(map(str, customer_ids))
+    sub = customers_engine_gdf[customers_engine_gdf["customer_id"].astype(str).isin(wanted)]
+    ids = [str(c) for c in sub["customer_id"]]
+    coords = np.column_stack([sub.geometry.x.to_numpy(dtype=float), sub.geometry.y.to_numpy(dtype=float)])
+    return coords, ids
+
+
+def _labels_to_groups(ids: List[str], labels: np.ndarray) -> List[List[str]]:
+    """Group ids by integer cluster label, returned in stable label order."""
+    buckets: Dict[int, List[str]] = {}
+    for cid, lab in zip(ids, labels):
+        buckets.setdefault(int(lab), []).append(cid)
+    return [sorted(v) for _, v in sorted(buckets.items())]
+
+
+def cluster_diameters_m(coords_m: np.ndarray, labels: np.ndarray) -> Dict[int, float]:
+    """Diameter (max intra-cluster pairwise distance, metres) of each cluster.
+
+    Large clusters are first reduced to their convex-hull vertices (the diameter
+    of a planar point set is attained by hull points), with a plain ``pdist``
+    fallback for collinear/degenerate geometries.
+    """
+    coords = np.asarray(coords_m, dtype=float)
+    labels = np.asarray(labels, dtype=int)
+    out: Dict[int, float] = {}
+    for lab in np.unique(labels):
+        pts = coords[labels == lab]
+        if pts.shape[0] < 2:
+            out[int(lab)] = 0.0
+            continue
+        if pts.shape[0] >= _HULL_MIN_POINTS:
+            try:
+                pts = pts[ConvexHull(pts).vertices]
+            except QhullError:
+                pass
+        out[int(lab)] = float(pdist(pts).max())
+    return out
+
+
+def partition_complete_linkage(coords_m: np.ndarray, max_diameter_m: float) -> np.ndarray:
+    """Complete-linkage hierarchical clustering cut at ``max_diameter_m``.
+
+    Complete linkage merges, at each step, the pair whose merge yields the
+    smallest possible diameter; cutting the dendrogram at the threshold returns
+    clusters whose diameter is <= the cap BY CONSTRUCTION, with the number of
+    clusters emerging from the cut (no k to guess, deterministic, no PF).
+    """
+    coords = np.asarray(coords_m, dtype=float)
+    n = coords.shape[0]
+    if max_diameter_m <= 0:
+        raise ValueError(f"max_diameter_m must be > 0; got {max_diameter_m}")
+    if n <= 1:
+        return np.zeros(n, dtype=int)
+    Z = linkage(coords, method="complete")
+    return (fcluster(Z, t=float(max_diameter_m), criterion="distance") - 1).astype(int)
+
+
+def partition_kmeans(coords_m: np.ndarray, n_clusters: int, seed: int = 42, retries: int = 5) -> np.ndarray:
+    """Spatial k-means into exactly ``n_clusters`` non-empty compact clusters.
+
+    Deterministic given ``seed`` (fixed init, retried on degenerate draws).
+    """
+    coords = np.asarray(coords_m, dtype=float)
+    n = coords.shape[0]
+    if n_clusters <= 1:
+        return np.zeros(n, dtype=int)
+    if n_clusters > n:
+        raise ValueError(f"{n_clusters} clusters requested but only {n} customers")
+    for attempt in range(retries):
+        rng_seed = int(seed) + attempt
+        np.random.seed(rng_seed)
+        try:
+            _, labels = kmeans2(coords, n_clusters, minit="++", seed=rng_seed)
+        except Exception:
+            continue
+        if len(np.unique(labels)) == n_clusters:
+            return labels.astype(int)
+    raise ValueError(
+        f"k-means failed to produce {n_clusters} non-empty clusters after {retries} attempts "
+        f"(n={n}); too few distinct customer locations for this many zones."
+    )
+
+
+def suggest_zone_start(coords_m: np.ndarray, hopeless_diameter_m: float = 2000.0) -> int:
+    """Physically-motivated starting number of zones for the voltage-cap loop.
+
+    A cluster wider than ~2 km cannot hold a 10% LV drop at village loads, so
+    the complete-linkage cluster count at that "hopeless" diameter is the
+    smallest zone count not doomed by geometry. The loop still backtracks below
+    this seed, so it never prevents finding the true minimum.
+    """
+    coords = np.asarray(coords_m, dtype=float)
+    if coords.shape[0] <= 1:
+        return 1
+    Z = linkage(coords, method="complete")
+    ncl = len(np.unique(fcluster(Z, t=float(hopeless_diameter_m), criterion="distance")))
+    return max(1, int(ncl))
+
+
+def _split_over_cap(
+    group: List[str],
+    customers_engine_gdf: gpd.GeoDataFrame,
+    customers_df: pd.DataFrame,
+    horizon_years: int,
+    max_zone_kva: float,
+    seed: int,
+) -> List[List[str]]:
+    """Recursively bisect a group until every child is within the kVA cap.
+
+    A single customer whose own apparent power exceeds the cap is returned as a
+    singleton (unavoidable: no procurable transformer covers it) — the caller's
+    post-condition allows singletons over cap.
+    """
+    if len(group) <= 1 or zone_apparent_power_kva(group, customers_df, horizon_years) <= max_zone_kva:
+        return [sorted(group)]
+    coords, ids = _coords_and_ids(group, customers_engine_gdf)
+    try:
+        labels = partition_kmeans(coords, 2, seed=seed)
+    except ValueError:
+        return [[i] for i in ids]  # coincident points: cannot bisect further
+    children = _labels_to_groups(ids, labels)
+    if len(children) < 2:
+        return [[i] for i in ids]
+    out: List[List[str]] = []
+    for child in children:
+        out.extend(_split_over_cap(child, customers_engine_gdf, customers_df, horizon_years, max_zone_kva, seed))
+    return out
+
+
+def enforce_kva_cap(
+    groups: List[List[str]],
+    customers_engine_gdf: gpd.GeoDataFrame,
+    customers_df: pd.DataFrame,
+    horizon_years: int,
+    max_zone_kva: float,
+    seed: int = 42,
+) -> List[List[str]]:
+    """Split any zone exceeding the largest procurable transformer rating.
+
+    This is what keeps the kVA cap alive under the geometric/electrical criteria:
+    complete-linkage and k-means bound *distance*, not load, so a dense compact
+    cluster can still exceed the biggest catalogue transformer and must be split.
+    """
+    out: List[List[str]] = []
+    for g in groups:
+        if not g:
+            continue
+        out.extend(_split_over_cap(g, customers_engine_gdf, customers_df, horizon_years, max_zone_kva, seed))
+    return out
+
+
+def partition_zones(
+    criterion: str,
+    customer_ids: List[str],
+    customers_engine_gdf: gpd.GeoDataFrame,
+    source: Dict[str, Any],
+    crs_epsg: int,
+    *,
+    customers_df: pd.DataFrame,
+    horizon_years: int,
+    max_zone_kva: float,
+    max_zone_radius_m: float,
+    max_zone_customers: int,
+    max_cluster_diameter_m: float = 500.0,
+    n_zones: Optional[int] = None,
+    seed: int = 42,
+) -> List[List[str]]:
+    """Dispatch to the requested partitioning criterion; all enforce the kVA cap.
+
+    - ``capacity``: greedy farthest-first packing (legacy default), already
+      kVA-capped internally.
+    - ``distance_cap``: complete-linkage cut at ``max_cluster_diameter_m`` then
+      kVA split. Deterministic, one-shot, no power flow.
+    - ``voltage_cap``: k-means into ``n_zones`` clusters then kVA split; the
+      workflow runner iterates ``n_zones`` and validates each with a power flow.
+    """
+    if criterion == "capacity":
+        return partition_service_zones(
+            customer_ids, customers_engine_gdf, source, crs_epsg,
+            customers_df=customers_df, horizon_years=horizon_years,
+            max_zone_radius_m=max_zone_radius_m, max_zone_kva=max_zone_kva,
+            max_zone_customers=max_zone_customers,
+        )
+
+    coords, ids = _coords_and_ids(customer_ids, customers_engine_gdf)
+    if criterion == "distance_cap":
+        labels = partition_complete_linkage(coords, float(max_cluster_diameter_m))
+        groups = _labels_to_groups(ids, labels)
+    elif criterion == "voltage_cap":
+        if n_zones is None:
+            raise ValueError("voltage_cap partitioning requires n_zones")
+        if int(n_zones) <= 1 or coords.shape[0] <= 1:
+            groups = [sorted(ids)]
+        else:
+            labels = partition_kmeans(coords, int(n_zones), seed=seed)
+            groups = _labels_to_groups(ids, labels)
+    else:
+        raise ValueError(f"Unknown clustering_criterion: {criterion!r}")
+
+    return enforce_kva_cap(groups, customers_engine_gdf, customers_df, horizon_years, max_zone_kva, seed=seed)
+
+
+def size_stepup_kva(s_system_kva: float, sizing_margin: float, transformers_df: pd.DataFrame) -> float:
+    """Plant step-up rating: system apparent power * margin, snapped to the next
+    catalogue size, or rounded up to the next 50 kVA above the catalogue.
+
+    The step-up is a single project-procured unit, so (unlike the zone step-downs
+    that respect the kVA cap) it is allowed to exceed the largest catalogue entry.
+    """
+    target = float(s_system_kva) * float(sizing_margin)
+    sizes = sorted(float(s) for s in transformers_df["sn_kva"])
+    if target <= 0.0:
+        return sizes[0]
+    for s in sizes:
+        if s >= target:
+            return s
+    return float(math.ceil(target / 50.0) * 50.0)
+
+
+def build_stepup_spec(
+    s_system_kva: float,
+    transformers_df: pd.DataFrame,
+    *,
+    mv_kv: float,
+    lv_kv: float,
+    sizing_margin: float = 1.2,
+) -> Dict[str, Any]:
+    """Electrical spec for the plant LV->MV step-up transformer.
+
+    Per-unit short-circuit / no-load characteristics are inherited from the
+    largest catalogue transformer (size-robust); the rating is sized to the whole
+    settlement's coincident apparent power and may exceed the catalogue.
+    """
+    largest = transformers_df.sort_values("sn_kva").iloc[-1].to_dict()
+    sn_kva = size_stepup_kva(s_system_kva, sizing_margin, transformers_df)
+    scale = sn_kva / float(largest["sn_kva"]) if float(largest["sn_kva"]) > 0 else 1.0
+    return {
+        "transformer_id": "stepup",
+        "sn_kva": float(sn_kva),
+        "vn_hv_kv": float(mv_kv),
+        "vn_lv_kv": float(lv_kv),
+        "vk_percent": float(largest["vk_percent"]),
+        "vkr_percent": float(largest["vkr_percent"]),
+        "pfe_kw": float(largest.get("pfe_kw", 0.0)) * scale,
+        "i0_percent": float(largest.get("i0_percent", 0.0)),
+        "max_loading_percent": float(largest.get("max_loading_percent", 100.0)),
+        "cost_fixed": float(largest.get("cost_fixed", 0.0)),
+        "cost_per_kva": float(largest.get("cost_per_kva", 0.0)),
+    }
 
 
 def _transformer_point(centroid_xy, crs_epsg: int, roads_gdf: Optional[gpd.GeoDataFrame]):
