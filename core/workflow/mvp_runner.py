@@ -529,10 +529,12 @@ def _voltage_cap_search(ctx, grid_ids, crs_epsg, max_kva, max_transformers, step
     on_coincident = str(params.get("k_selection_snapshot", "design")) == "coincident"
 
     built_by_k: Dict[int, Dict[str, Any]] = {}
+    attempts_made = 0
 
     def attempt(n_zones: int) -> Optional[Dict[str, Any]]:
         """Build at ``n_zones``; None when that count cannot be built or the budget is spent."""
-        if len(built_by_k) >= max_attempts:
+        nonlocal attempts_made
+        if attempts_made >= max_attempts:
             iterations.append(_k_search_stop(
                 n_zones,
                 f"stopped searching: reached the {max_attempts}-attempt budget "
@@ -548,6 +550,7 @@ def _voltage_cap_search(ctx, grid_ids, crs_epsg, max_kva, max_transformers, step
                 n_zones=int(n_zones), seed=seed,
                 coincidence_factor=ctx["tx_coincidence"],
             )
+            attempts_made += 1
             built = _build_mvlv_at(ctx, groups, stepup_spec)
         except ValueError as exc:
             # Too few distinct locations for this many zones, or a degenerate geometry.
