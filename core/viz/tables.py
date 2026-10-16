@@ -97,6 +97,7 @@ NPC_COMPONENTS = {
     "pole_cost": "Poles",
     "transformer_cost": "Transformers",
     "connection_metering_cost": "Connection & metering",
+    "service_drop_cost": "Service drops",
     "standalone_npc": "Stand-alone NPC",
     "loss_pv_cost": "Loss PV",
     "generation_npc": "Generation (LCOE)",

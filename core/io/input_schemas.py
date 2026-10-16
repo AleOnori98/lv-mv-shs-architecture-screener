@@ -232,6 +232,13 @@ COST_PARAMETER_DEFAULTS: Dict[str, float] = {
     # stays explicit, single-sourced and reported, with the loading headroom visible so the
     # slack is auditable instead of hidden.
     "transformer_sizing_coincidence_factor": 1.0,
+    # Fractional headroom added to a stand-alone package's peak/energy limits before
+    # testing eligibility. The catalogue is discrete and the horizon peak is compounded, so
+    # a zero tolerance makes eligibility a knife edge: a 0.25 kW household growing 4% over
+    # 15 years needs 0.45024 kW against a 0.45 kW package and misses by 0.05%, jumping to
+    # the next package up at +61% NPC. With all-or-nothing subtree eligibility, one such
+    # customer vetoes a whole branch.
+    "standalone_sizing_tolerance": 0.02,
     # Sending voltage at the plant LV slack; an explicit step-up transformer produces the real
     # drop onto the MV backbone (replaces the earlier fixed 1.04 pu slack on the MV bus).
     "source_vm_pu": 1.0,

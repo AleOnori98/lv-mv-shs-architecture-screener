@@ -9,12 +9,23 @@ from types import SimpleNamespace
 
 import pytest
 
-from core.workflow.mvp_runner import _select_standalone_clusters, detect_mvlv_subtree_candidates
+from core.workflow.mvp_runner import (
+    _select_standalone_clusters,
+    build_context,
+    detect_mvlv_subtree_candidates,
+)
 
 
 def _selection_ctx(inputs):
-    return {"customers": inputs["customers"], "packages": inputs["standalone_packages"],
-            "T": 15, "discount": 0.08, "log": []}
+    """Build the run context the same way the pipeline does, so it cannot drift."""
+    return build_context(
+        customers=inputs["customers"],
+        params=inputs["cost_parameters"],
+        lv_conductors=inputs["lv_conductors"],
+        packages=inputs["standalone_packages"],
+        horizon_years=15,
+        discount_rate=0.08,
+    )
 
 
 # --- The shared selection helper is purely economic, with no threshold gate ---------------

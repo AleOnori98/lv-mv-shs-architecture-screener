@@ -5,7 +5,7 @@ import math
 from dataclasses import dataclass
 from typing import Any, Dict, List
 
-from .npc import annuity_factor
+from .npc import annuity_factor, growth_annuity_factor
 
 
 @dataclass
@@ -15,16 +15,19 @@ class CostBreakdown:
     pole_cost: float = 0.0
     transformer_cost: float = 0.0
     connection_metering_cost: float = 0.0
+    service_drop_cost: float = 0.0
     standalone_npc: float = 0.0
     loss_pv_cost: float = 0.0
     generation_npc: float = 0.0
 
     _COMPONENTS = (
         "lv_line_cost", "mv_line_cost", "pole_cost", "transformer_cost",
-        "connection_metering_cost", "standalone_npc", "loss_pv_cost", "generation_npc",
+        "connection_metering_cost", "service_drop_cost",
+        "standalone_npc", "loss_pv_cost", "generation_npc",
     )
     _CAPEX_COMPONENTS = (
-        "lv_line_cost", "mv_line_cost", "pole_cost", "transformer_cost", "connection_metering_cost",
+        "lv_line_cost", "mv_line_cost", "pole_cost", "transformer_cost",
+        "connection_metering_cost", "service_drop_cost",
     )
 
     @property
@@ -73,6 +76,25 @@ def connection_capex(n_grid_customers: int, cost_params: Dict[str, float]) -> fl
     return float(n_grid_customers) * per
 
 
+def service_drop_capex(total_drop_m: float, cheapest_lv_cost_per_m: float, civil_multiplier: float) -> float:
+    """CAPEX of the service drops from each pole to its customers.
+
+    Drops are priced with the cheapest LV conductor as a proxy -- they are not separate
+    pandapower lines, so they carry no impedance in the power flow, only cost.
+
+    This component exists because the SHS screen already CREDITED avoided service drops in
+    ``_avoided_grid_cost`` while no candidate's NPC ever charged them: the gate was paid for
+    a saving the objective did not recognise, which biased every screen toward going
+    off-grid. Credit and charge now use the same proxy on the same metres.
+    """
+    return float(total_drop_m) * float(cheapest_lv_cost_per_m) * float(civil_multiplier)
+
+
+def cheapest_lv_cost_per_m(lv_conductors) -> float:
+    """``cost_per_m`` of the lowest-rank (cheapest) LV conductor in the catalogue."""
+    return float(lv_conductors.sort_values("rank").iloc[0]["cost_per_m"])
+
+
 def transformer_capex(transformers: list[Dict[str, Any]]) -> float:
     total = 0.0
     for tx in transformers:
@@ -80,19 +102,34 @@ def transformer_capex(transformers: list[Dict[str, Any]]) -> float:
     return total
 
 
-def generation_present_value(annual_kwh_total: float, cost_params: Dict[str, float]) -> float:
+def generation_present_value(
+    annual_kwh_total: float,
+    cost_params: Dict[str, float],
+    *,
+    growth_rate: float = 0.0,
+) -> float:
     """PV of the mini-grid generation cost for grid-served energy over the planning horizon.
 
-    ``annual_kwh_total`` is the grid-served annual energy (sum of ``annual_kwh_now`` over grid
-    customers). It is levelised at ``generation_lcoe_per_kwh`` and discounted with the horizon
-    annuity factor. Stand-alone customers are excluded here — their generation cost is already
-    inside the SHS package NPC — so grid and stand-alone are compared on the same footing.
+    ``annual_kwh_total`` is the grid-served annual energy TODAY (sum of ``annual_kwh_now``
+    over grid customers); ``growth_rate`` is the energy-weighted annual growth of that same
+    set. The stream is levelised at ``generation_lcoe_per_kwh`` over its actual growth
+    trajectory (:func:`~core.economics.npc.growth_annuity_factor`).
+
+    Stand-alone customers are excluded -- their generation cost is already inside the SHS
+    package NPC -- so grid and stand-alone are compared on the same footing.
+
+    Previously this held present-year energy flat for the whole horizon while the loss cost
+    was taken from the HORIZON power flow, also held flat: two different years of the same
+    growing demand added into one NPC. Both now use the same growth-aware discounting.
     """
     lcoe = float(cost_params.get("generation_lcoe_per_kwh", 0.0) or 0.0)
     kwh = float(annual_kwh_total or 0.0)
     if lcoe <= 0.0 or kwh <= 0.0:
         return 0.0
-    return lcoe * kwh * annuity_factor(float(cost_params["discount_rate"]), int(cost_params["planning_horizon_years"]))
+    return lcoe * kwh * growth_annuity_factor(
+        float(cost_params["discount_rate"]), float(growth_rate),
+        int(cost_params["planning_horizon_years"]),
+    )
 
 
 def loss_energy_price(cost_params: Dict[str, float]) -> float:
@@ -113,8 +150,17 @@ def loss_energy_price(cost_params: Dict[str, float]) -> float:
     return float(cost_params.get("generation_lcoe_per_kwh", 0.0) or 0.0)
 
 
-def loss_present_value(losses_kw: float, cost_params: Dict[str, float]) -> float:
+def loss_present_value(
+    losses_kw: float,
+    cost_params: Dict[str, float],
+    *,
+    growth_rate: float = 0.0,
+) -> float:
     """PV of annual loss energy cost over the horizon (snapshot losses scaled to a year).
+
+    ``losses_kw`` is the horizon loss snapshot and ``growth_rate`` the energy-weighted
+    demand growth, so the year-T snapshot can be back-cast and levelised over the actual
+    trajectory rather than charged flat for every year.
 
     Returns **NaN** when the loss snapshot is unknown (a diverged power flow). It is NOT
     zero: charging nothing for the losses of a network that could not be solved makes a
@@ -123,6 +169,17 @@ def loss_present_value(losses_kw: float, cost_params: Dict[str, float]) -> float
     """
     if losses_kw is None or math.isnan(float(losses_kw)):
         return float("nan")
-    annual_kwh = float(losses_kw) * 8760.0 * float(cost_params["loss_load_factor"])
-    annual_cost = annual_kwh * loss_energy_price(cost_params)
-    return annual_cost * annuity_factor(float(cost_params["discount_rate"]), int(cost_params["planning_horizon_years"]))
+    r = float(cost_params["discount_rate"])
+    T = int(cost_params["planning_horizon_years"])
+    price = loss_energy_price(cost_params)
+
+    # Losses scale with current squared, so loss energy grows at roughly (1+g)^2 - 1.
+    g_load = float(growth_rate)
+    g_loss = (1.0 + g_load) ** 2 - 1.0
+
+    # ``losses_kw`` is the HORIZON snapshot (kept so a diverged horizon power flow still
+    # propagates as NaN). Back-cast it to year 0 and levelise over the growth trajectory,
+    # instead of charging the year-T loss for all T years.
+    losses_now_kw = float(losses_kw) / ((1.0 + g_loss) ** T) if T > 0 else float(losses_kw)
+    annual_kwh_now = losses_now_kw * 8760.0 * float(cost_params["loss_load_factor"])
+    return annual_kwh_now * price * growth_annuity_factor(r, g_loss, T)

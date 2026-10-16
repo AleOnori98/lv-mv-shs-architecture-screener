@@ -182,6 +182,16 @@ with econ_col.container(border=True):
     st.caption("Discounting and levelised generation cost over the planning period.")
     planning_horizon_years = st.number_input("Planning horizon [years]", 1, 40, int(cp.get("planning_horizon_years", 15)))
     discount_rate = st.number_input("Discount rate", 0.0, 0.30, float(cp.get("discount_rate", 0.08)), 0.01, format="%.2f")
+    standalone_sizing_tolerance = st.number_input(
+        "SHS package sizing tolerance", 0.0, 0.25,
+        float(cp.get("standalone_sizing_tolerance", 0.02)), 0.01, format="%.2f",
+        help="Fractional headroom added to a package's peak/energy limits before testing "
+             "eligibility. The catalogue is discrete and the horizon peak is compounded, so a zero "
+             "tolerance is a knife edge: a 0.25 kW household growing 4%% over 15 years needs "
+             "0.45024 kW against a 0.45 kW package and misses by 0.05%%, jumping to the next "
+             "package up at +61%% NPC. With all-or-nothing subtree eligibility one such customer "
+             "also vetoes a whole branch.",
+    )
     generation_lcoe_per_kwh = st.number_input(
         "Generation LCOE [€/kWh]", 0.0, 2.0, float(cp.get("generation_lcoe_per_kwh", 0.25)), 0.01, format="%.2f",
         help="Levelised cost of the mini-grid electricity, applied to grid-served energy over the horizon so "
@@ -266,6 +276,7 @@ eng = {
     "planning_horizon_years": planning_horizon_years,
     "discount_rate": discount_rate,
     "generation_lcoe_per_kwh": generation_lcoe_per_kwh,
+    "standalone_sizing_tolerance": standalone_sizing_tolerance,
     # Load-flow limits
     "voltage_min_pu": voltage_min_pu,
     "voltage_max_pu": voltage_max_pu,

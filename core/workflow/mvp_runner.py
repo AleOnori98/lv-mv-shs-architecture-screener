@@ -78,11 +78,99 @@ def _stress_lv_powerflow(topology, customers_df, conductor_by_line, constraints,
     return model, run_powerflow(model, constraints)
 
 
+def build_context(
+    *,
+    customers: pd.DataFrame,
+    params: Dict[str, Any],
+    lv_conductors: pd.DataFrame,
+    packages: pd.DataFrame,
+    horizon_years: int,
+    discount_rate: float,
+    **extra: Any,
+) -> Dict[str, Any]:
+    """Assemble the per-run context the cost/screen helpers read.
+
+    Every helper that prices something takes this dict, so the derived lookups
+    (``annual_kwh_by_id``, ``growth_by_id``, the resolved transformer sizing factor) belong
+    in one place. Hand-rolling the dict -- which the tests used to do -- means a new key
+    added to the pipeline silently breaks callers with a ``KeyError`` far from the cause,
+    so both the runner and the tests build it here.
+    """
+    cid = customers["customer_id"].astype(str)
+    ctx: Dict[str, Any] = {
+        "customers": customers,
+        "params": params,
+        "lv_conductors": lv_conductors,
+        "packages": packages,
+        "T": int(horizon_years),
+        "discount": float(discount_rate),
+        "annual_kwh_by_id": {
+            str(c): float(v) for c, v in zip(cid, customers["annual_kwh_now"])
+        },
+        "growth_by_id": {
+            str(c): float(v) for c, v in zip(cid, customers["growth_rate"])
+        },
+        "coincidence": float(params["coincidence_factor"]),
+        # Diversity basis for transformer sizing / the zone kVA cap; 0 means "track the
+        # design coincidence factor" (see transformer_sizing_coincidence_factor).
+        "tx_coincidence": (
+            float(params["transformer_sizing_coincidence_factor"])
+            if float(params.get("transformer_sizing_coincidence_factor", 0.0) or 0.0) > 0.0
+            else float(params["coincidence_factor"])
+        ),
+        "log": [],
+    }
+    ctx.update(extra)
+    return ctx
+
+
+def _energy_weighted_growth(ctx, customer_ids) -> float:
+    """Energy-weighted mean annual demand growth of a customer set.
+
+    One growth rate for the whole set, weighted by each customer's share of the energy, so
+    the levelised energy costs track the trajectory of the demand that actually drives them.
+    """
+    kwh_by_id, growth_by_id = ctx["annual_kwh_by_id"], ctx["growth_by_id"]
+    total = 0.0
+    weighted = 0.0
+    for c in customer_ids:
+        kwh = kwh_by_id.get(str(c), 0.0)
+        total += kwh
+        weighted += kwh * growth_by_id.get(str(c), 0.0)
+    return (weighted / total) if total > 0 else 0.0
+
+
 def _generation_npc(ctx, grid_ids) -> float:
-    """PV of mini-grid generation cost for the given grid-served customers (see cost_model)."""
-    kwh_by_id = ctx["annual_kwh_by_id"]
-    total_kwh = sum(kwh_by_id.get(str(c), 0.0) for c in grid_ids)
-    return cm.generation_present_value(total_kwh, ctx["params"])
+    """PV of mini-grid generation cost for the given grid-served customers (see cost_model).
+
+    Uses each customer's own growth rate exactly (not the weighted mean), since the sum of
+    per-customer PVs is exact and just as cheap here.
+    """
+    kwh_by_id, growth_by_id = ctx["annual_kwh_by_id"], ctx["growth_by_id"]
+    total = 0.0
+    for c in grid_ids:
+        key = str(c)
+        kwh = kwh_by_id.get(key, 0.0)
+        if kwh:
+            total += cm.generation_present_value(
+                kwh, ctx["params"], growth_rate=growth_by_id.get(key, 0.0)
+            )
+    return total
+
+
+def _loss_npc(ctx, losses_kw, grid_ids) -> float:
+    """PV of loss energy for a candidate, levelised on that candidate's demand growth."""
+    return cm.loss_present_value(
+        losses_kw, ctx["params"], growth_rate=_energy_weighted_growth(ctx, grid_ids)
+    )
+
+
+def _service_drop_cost(ctx, total_drop_m: float) -> float:
+    """CAPEX of the service drops, on the same proxy the avoided-cost side credits."""
+    return cm.service_drop_capex(
+        total_drop_m, cm.cheapest_lv_cost_per_m(ctx["lv_conductors"]),
+        ctx["params"]["civil_logistics_multiplier"],
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -107,7 +195,9 @@ def _run_full_lv(ctx) -> CaseResult:
     cost.lv_line_cost = cm.line_cost(sizing.conductor_by_line, _length_by_line(topo), ctx["params"]["civil_logistics_multiplier"])
     cost.pole_cost = cm.pole_capex(len(topo.pole_xy), ctx["params"]["pole_cost"], ctx["params"]["civil_logistics_multiplier"])
     cost.connection_metering_cost = cm.connection_capex(len(topo.served_customer_ids), ctx["params"])
-    cost.loss_pv_cost = cm.loss_present_value(sizing.outcome.losses_kw, ctx["params"])
+    drop_total_m = sum(topo.service_drop_m.get(c, 0.0) for c in topo.served_customer_ids)
+    cost.service_drop_cost = _service_drop_cost(ctx, drop_total_m)
+    cost.loss_pv_cost = _loss_npc(ctx, sizing.outcome.losses_kw, topo.served_customer_ids)
     cost.generation_npc = _generation_npc(ctx, topo.served_customer_ids)
 
     assign = {c: {"status": "grid_now", "architecture": "Full LV", "cluster_id": "", "transformer_id": "", "package_id": "", "reason": "connected in Full LV"} for c in topo.served_customer_ids}
@@ -149,14 +239,14 @@ def _avoided_grid_cost(cluster: Cluster, ctx, *, include_losses: bool) -> float:
     """
     params = ctx["params"]
     mult = float(params["civil_logistics_multiplier"])
-    cheapest_lv = ctx["lv_conductors"].sort_values("rank").iloc[0].to_dict()
-    service_drop_cost = float(cluster.metadata.get("service_drop_m", 0.0)) * float(cheapest_lv["cost_per_m"]) * mult
+    # Same helper, same proxy, same metres as the candidate NPC now charges.
+    service_drop_cost = _service_drop_cost(ctx, float(cluster.metadata.get("service_drop_m", 0.0)))
     conn = cm.connection_capex(cluster.n_customers, params)
     pole_cost = cm.pole_capex(len(cluster.pole_ids), params["pole_cost"], mult)
     generation_pv = _generation_npc(ctx, cluster.customer_ids)
     avoided = cluster.branch_cost + service_drop_cost + conn + pole_cost + generation_pv
     if include_losses:
-        avoided += cm.loss_present_value(getattr(cluster, "branch_losses_kw", 0.0), params)
+        avoided += _loss_npc(ctx, getattr(cluster, "branch_losses_kw", 0.0), cluster.customer_ids)
     return float(avoided)
 
 
@@ -200,7 +290,11 @@ def _select_standalone_clusters(ctx, clusters, avoided_cost_fn, architecture_lab
             continue
         if any(c in claimed for c in cl.customer_ids):  # a coarser subtree already took these
             continue
-        sa = cluster_standalone(cl.customer_ids, ctx["customers"], ctx["packages"], horizon_years=T, discount_rate=rate)
+        sa = cluster_standalone(
+            cl.customer_ids, ctx["customers"], ctx["packages"], horizon_years=T,
+            discount_rate=rate,
+            sizing_tolerance=float(ctx["params"].get("standalone_sizing_tolerance", 0.0) or 0.0),
+        )
         if not sa["eligible"]:
             _log(ctx["log"], "standalone", cid, cl.cluster_id, "keep_grid", "; ".join(sa["blocking_reasons"]) or "not eligible")
             continue
@@ -255,7 +349,9 @@ def _run_lv_standalone(ctx, full_res: CaseResult, sa_customers, sa_assignments, 
     cost.lv_line_cost = cm.line_cost(sizing.conductor_by_line, _length_by_line(topo), ctx["params"]["civil_logistics_multiplier"])
     cost.pole_cost = cm.pole_capex(len(topo.pole_xy), ctx["params"]["pole_cost"], ctx["params"]["civil_logistics_multiplier"])
     cost.connection_metering_cost = cm.connection_capex(len(topo.served_customer_ids), ctx["params"])
-    cost.loss_pv_cost = cm.loss_present_value(sizing.outcome.losses_kw, ctx["params"])
+    drop_total_m = sum(topo.service_drop_m.get(c, 0.0) for c in topo.served_customer_ids)
+    cost.service_drop_cost = _service_drop_cost(ctx, drop_total_m)
+    cost.loss_pv_cost = _loss_npc(ctx, sizing.outcome.losses_kw, topo.served_customer_ids)
     cost.generation_npc = _generation_npc(ctx, topo.served_customer_ids)
     cost.standalone_npc = sa_npc_total
 
@@ -708,7 +804,8 @@ def _run_mvlv(ctx, grid_ids: List[str], *, cid: str = "C_MVLV", architecture: st
     grid_served_ids = [c for z in plan.zones for c in z["topology"].served_customer_ids]
     n_grid = len(grid_served_ids)
     cost.connection_metering_cost = cm.connection_capex(n_grid, ctx["params"])
-    cost.loss_pv_cost = cm.loss_present_value(final_outcome.losses_kw, ctx["params"])
+    cost.service_drop_cost = _service_drop_cost(ctx, service_drop_total)
+    cost.loss_pv_cost = _loss_npc(ctx, final_outcome.losses_kw, grid_served_ids)
     cost.generation_npc = _generation_npc(ctx, grid_served_ids)
     cost.standalone_npc = float(sa_npc)
 
@@ -918,6 +1015,7 @@ def _cost_row(res: CaseResult) -> Dict[str, Any]:
         "lv_line_cost": round(c.lv_line_cost, 0), "mv_line_cost": round(c.mv_line_cost, 0),
         "pole_cost": round(c.pole_cost, 0), "transformer_cost": round(c.transformer_cost, 0),
         "connection_metering_cost": round(c.connection_metering_cost, 0),
+        "service_drop_cost": round(c.service_drop_cost, 0),
         "standalone_npc": round(c.standalone_npc, 0), "loss_pv_cost": round(c.loss_pv_cost, 0),
         "generation_npc": round(c.generation_npc, 0),
         "total_npc": round(c.total_npc, 0),
@@ -950,7 +1048,7 @@ def run_simplified_mvp(
               "coincidence_factor", "generation_lcoe_per_kwh",
               "clustering_criterion", "max_cluster_diameter_m", "max_transformers", "source_vm_pu",
               "design_voltage_margin_pu", "k_selection_snapshot",
-              "transformer_sizing_coincidence_factor"):
+              "transformer_sizing_coincidence_factor", "standalone_sizing_tolerance"):
         if k in eng and eng[k] is not None:
             params[k] = eng[k]
     T = int(params["planning_horizon_years"])
@@ -962,28 +1060,16 @@ def run_simplified_mvp(
     }
 
     gdf, crs_meta = customers_to_engine_gdf(customers)
-    log: List[Dict[str, Any]] = []
-    annual_kwh_by_id = {
-        str(cid): float(kwh)
-        for cid, kwh in zip(customers["customer_id"].astype(str), customers["annual_kwh_now"])
-    }
-    ctx = {
-        "customers": customers, "gdf": gdf, "roads": roads, "crs_meta": crs_meta, "source": source,
-        "eng": eng, "params": params, "constraints": constraints, "T": T,
-        "discount": float(params["discount_rate"]), "lv_conductors": lv_conductors,
-        "mv_conductors": mv_conductors, "transformers": transformers, "packages": standalone_packages,
-        "lv_kv": float(source.get("lv_voltage_kv", 0.4)), "mv_kv": float(source.get("mv_voltage_kv", 11.0)),
-        "coincidence": float(params["coincidence_factor"]), "annual_kwh_by_id": annual_kwh_by_id,
-        # Diversity basis for transformer sizing / the zone kVA cap. Defaults to the design
-        # coincidence factor so the rating and the loading it is validated against agree.
-        "tx_coincidence": (
-            float(params["transformer_sizing_coincidence_factor"])
-            if float(params.get("transformer_sizing_coincidence_factor", 0.0) or 0.0) > 0.0
-            else float(params["coincidence_factor"])
-        ),
-        "source_vm_pu": float(params["source_vm_pu"]),
-        "log": log,
-    }
+    ctx = build_context(
+        customers=customers, params=params, lv_conductors=lv_conductors,
+        packages=standalone_packages, horizon_years=T, discount_rate=float(params["discount_rate"]),
+        gdf=gdf, roads=roads, crs_meta=crs_meta, source=source, eng=eng, constraints=constraints,
+        mv_conductors=mv_conductors, transformers=transformers,
+        lv_kv=float(source.get("lv_voltage_kv", 0.4)),
+        mv_kv=float(source.get("mv_voltage_kv", 11.0)),
+        source_vm_pu=float(params["source_vm_pu"]),
+    )
+    log = ctx["log"]
 
     emit("Generating full LV topology and running LV conductor sizing...")
     full_res = _run_full_lv(ctx)
