@@ -19,12 +19,6 @@ def highlight_recommended(comparison: pd.DataFrame, recommended: str) -> pd.io.f
     return comparison.style.apply(_row_style, axis=1)
 
 
-def status_counts(strategy: pd.DataFrame) -> pd.DataFrame:
-    return (
-        strategy["recommended_status"].value_counts().rename_axis("status").reset_index(name="customers")
-    )
-
-
 def shs_screening_table(decision_log: pd.DataFrame, candidate_id: str) -> pd.DataFrame:
     """Per-leaf-branch SHS economics for one screen (B or D), parsed from the decision log.
 

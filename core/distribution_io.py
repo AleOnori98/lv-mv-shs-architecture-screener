@@ -1,12 +1,10 @@
 from __future__ import annotations
 
 import math
-from typing import Any, Optional
+from typing import Any
 
 import geopandas as gpd
-import pandas as pd
 from pyproj import CRS
-from shapely.geometry import Point
 
 from config.settings import DEFAULT_TARGET_CRS
 
@@ -57,76 +55,3 @@ def select_projected_crs(
         return fallback, meta
 
 
-def load_and_transform_data(
-    file,
-    target_crs: Any | None = None,
-    *,
-    return_metadata: bool = False,
-) -> Optional[gpd.GeoDataFrame] | tuple[Optional[gpd.GeoDataFrame], dict[str, Any]]:
-    """
-    Load and transform spatial data from an uploaded file.
-
-    Supported formats
-    -----------------
-    - GeoPackage (.gpkg): uses the file CRS when available, otherwise falls back to the
-      selected/projected working CRS.
-    - Excel (.xlsx): expects 'latitude' and 'longitude' columns in WGS84 (EPSG:4326).
-
-    Returns
-    -------
-    GeoDataFrame in the selected/projected CRS, or None if the file cannot be parsed.
-    When `return_metadata=True`, also returns a dict with CRS-selection details.
-    """
-    metadata: dict[str, Any] = {
-        "input_crs": None,
-        "projected_crs": None,
-        "projected_crs_epsg": None,
-        "crs_selection_method": None,
-        "crs_selection_note": None,
-    }
-
-    if file is None:
-        return (None, metadata) if return_metadata else None
-
-    name = getattr(file, "name", "")
-    gdf: Optional[gpd.GeoDataFrame] = None
-
-    if name.endswith(".gpkg"):
-        gdf = gpd.read_file(file)
-    elif name.endswith(".xlsx"):
-        df = pd.read_excel(file)
-        if "latitude" in df.columns and "longitude" in df.columns:
-            geometry = [Point(xy) for xy in zip(df["longitude"], df["latitude"])]
-            gdf = gpd.GeoDataFrame(df, geometry=geometry)
-            gdf.set_crs(epsg=4326, inplace=True)
-
-    if gdf is None:
-        return (None, metadata) if return_metadata else None
-
-    if target_crs is None:
-        selected_crs, meta = select_projected_crs(gdf, fallback_crs=DEFAULT_TARGET_CRS)
-    else:
-        selected_crs = CRS.from_user_input(target_crs)
-        meta = {
-            "input_crs": None if gdf.crs is None else gdf.crs.to_string(),
-            "crs_selection_method": "provided_target_crs",
-            "crs_selection_note": None,
-        }
-        if gdf.crs is None:
-            meta["crs_selection_method"] = "provided_target_crs_missing_input_assumed"
-            meta["crs_selection_note"] = (
-                "Input CRS was missing; assumed coordinates already match the provided target CRS."
-            )
-
-    if gdf.crs is None:
-        gdf = gdf.set_crs(selected_crs)
-
-    if gdf.crs != selected_crs:
-        gdf = gdf.to_crs(selected_crs)
-
-    metadata.update(meta)
-    metadata["projected_crs"] = selected_crs.to_string()
-    metadata["projected_crs_epsg"] = selected_crs.to_epsg()
-
-    out = gdf[gdf.is_valid]
-    return (out, metadata) if return_metadata else out

@@ -9,11 +9,9 @@ Run:  python scripts/build_realistic_example.py
 """
 from __future__ import annotations
 
-import math
 from pathlib import Path
 
 import geopandas as gpd
-import numpy as np
 import pandas as pd
 from shapely.geometry import Point
 from shapely.ops import nearest_points

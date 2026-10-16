@@ -129,7 +129,6 @@ def refresh_dataset_registry() -> Dict[str, Dict[str, Any]]:
 DATASETS: Dict[str, Dict[str, Any]] = refresh_dataset_registry()
 
 DEFAULT_DATASET = "mvp" if "mvp" in DATASETS else next(iter(DATASETS), "")
-EXAMPLE_DIR = DATASETS[DEFAULT_DATASET]["dir"] if DEFAULT_DATASET else PathManager.EXAMPLES
 
 
 def _resolve_dataset_key(dataset: str) -> str:

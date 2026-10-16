@@ -76,7 +76,6 @@ def load_roads(file: Any) -> Optional[gpd.GeoDataFrame]:
     """Load roads from GeoJSON or GPKG (None-safe). Returns a GeoDataFrame in EPSG:4326."""
     if file is None:
         return None
-    name = str(getattr(file, "name", file) or "")
     if hasattr(file, "seek"):
         try:
             file.seek(0)

@@ -8,7 +8,7 @@ import math
 import networkx as nx
 import numpy as np
 import pandas as pd
-from shapely.geometry import LineString, Point
+from shapely.geometry import Point
 
 from config.settings import (
     CRITICAL_PRIORITY_THRESHOLD,
@@ -27,7 +27,6 @@ from config.settings import (
     ROAD_EDGE_SAMPLE_SPACING_M,
     ROAD_OFFROAD_PENALTY_FACTOR,
 )
-from .distribution_io import load_and_transform_data
 from .distribution_algos import (
     collect_sampled_points,
     associate_buildings_to_poles,
@@ -661,7 +660,7 @@ def _run_low_voltage_core(
     # Recommended tolerance: 0.5–1.0 m depending on input cleanliness
     DEDUP_TOL_M = PRE_MST_DEDUPLICATION_TOLERANCE_M
 
-    gdf_final_poles, associations_df, pole_id_remap = deduplicate_poles_with_remap(
+    gdf_final_poles, associations_df, _ = deduplicate_poles_with_remap(
         gdf_final_poles,
         associations_df,
         tol_m=DEDUP_TOL_M,

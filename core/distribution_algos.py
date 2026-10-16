@@ -325,22 +325,6 @@ def _build_sampled_road_graph(
     return graph, node_points
 
 
-def build_sampled_road_routing_graph(
-    gdf_roads: gpd.GeoDataFrame | None,
-    *,
-    sample_spacing_m: float = ROAD_EDGE_SAMPLE_SPACING_M,
-    snap_tolerance_m: float = 5.0,
-) -> tuple[nx.Graph | None, Dict[tuple[float, float], Point]]:
-    """
-    Public wrapper for the planning-level road graph used by LV and MV routing.
-    """
-    return _build_sampled_road_graph(
-        gdf_roads,
-        sample_spacing_m=float(sample_spacing_m),
-        snap_tolerance_m=float(snap_tolerance_m),
-    )
-
-
 def _nearest_road_node(
     point: Point,
     node_points: Dict[tuple[float, float], Point],
@@ -357,16 +341,6 @@ def _nearest_road_node(
             best_point = candidate
             best_distance = distance
     return best_key, best_point, best_distance
-
-
-def nearest_road_node(
-    point: Point,
-    node_points: Dict[tuple[float, float], Point],
-) -> tuple[tuple[float, float] | None, Point | None, float]:
-    """
-    Public wrapper for snapping terminals to a sampled road-routing graph.
-    """
-    return _nearest_road_node(point, node_points)
 
 
 def _road_route_between_points(

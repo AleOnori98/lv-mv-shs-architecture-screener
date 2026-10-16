@@ -458,7 +458,7 @@ def _build_mvlv_at(ctx, groups: List[List[str]], stepup_spec: Dict[str, Any]) ->
     for rank_i in range(len(ctx["mv_conductors"])):
         mv_cond = ctx["mv_conductors"].iloc[rank_i].to_dict()
         final_model = build_mvlv_net(
-            plan, ctx["customers"], core_conductor_by_line={}, zone_conductor_by_line=zone_cond,
+            plan, ctx["customers"], zone_conductor_by_line=zone_cond,
             mv_conductor=mv_cond, transformer_by_zone=transformer_by_zone,
             lv_kv=ctx["lv_kv"], mv_kv=ctx["mv_kv"], horizon_years=T, apply_growth=True,
             stepup_transformer=stepup_spec, coincidence_factor=ctx["coincidence"],
@@ -741,7 +741,7 @@ def _build_mvlv(ctx, grid_ids: List[str]) -> Dict[str, Any]:
     # Coincident-peak stress: same network + chosen MV conductor, every customer at horizon peak
     # simultaneously (factor 1.0). Reported alongside the design outcome, not used to gate feasibility.
     stress_model = build_mvlv_net(
-        plan, ctx["customers"], core_conductor_by_line={}, zone_conductor_by_line=best["zone_cond"],
+        plan, ctx["customers"], zone_conductor_by_line=best["zone_cond"],
         mv_conductor=best["mv_cond"], transformer_by_zone=best["transformer_by_zone"],
         lv_kv=ctx["lv_kv"], mv_kv=ctx["mv_kv"], horizon_years=T, apply_growth=True,
         stepup_transformer=stepup_spec, coincidence_factor=1.0, source_vm_pu=ctx["source_vm_pu"],
@@ -806,7 +806,7 @@ def _run_mvlv(ctx, grid_ids: List[str], *, cid: str = "C_MVLV", architecture: st
          final_outcome.active_bottleneck, "mv_conductor", str((mv_cond or {}).get("conductor_id")))
 
     now_model = build_mvlv_net(
-        plan, ctx["customers"], core_conductor_by_line={}, zone_conductor_by_line=zone_cond,
+        plan, ctx["customers"], zone_conductor_by_line=zone_cond,
         mv_conductor=mv_cond, transformer_by_zone={z["zone_id"]: z["transformer_spec"] for z in plan.zones},
         lv_kv=ctx["lv_kv"], mv_kv=ctx["mv_kv"], horizon_years=T, apply_growth=False,
         stepup_transformer=stepup, source_vm_pu=ctx["source_vm_pu"],

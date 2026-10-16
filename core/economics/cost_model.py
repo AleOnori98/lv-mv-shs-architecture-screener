@@ -5,7 +5,7 @@ import math
 from dataclasses import dataclass
 from typing import Any, Dict, List
 
-from .npc import annuity_factor, growth_annuity_factor
+from .npc import growth_annuity_factor
 
 
 @dataclass

@@ -15,7 +15,7 @@ backbone — and, for a single zone, the whole zone — is excluded by construct
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional
 
 import networkx as nx
 
@@ -27,8 +27,7 @@ class Subtree:
     poles: List[int]                 # all poles in the subtree (branch_root down to its leaves)
     branch_root: int                 # child node c where the subtree begins
     boundary_node: int               # fork node B just upstream of branch_root
-    entry_edge: Tuple[int, int]      # (B, c): the line connecting the subtree to the grid
-    entry_edge_id: Optional[str]     # line_id of the entry edge
+    entry_edge_id: Optional[str]     # line_id of the edge (B, c) tying the subtree to the grid
     internal_edge_ids: List[str]     # line_ids of edges fully inside the subtree
 
 
@@ -69,7 +68,6 @@ def terminal_subtrees(graph: nx.Graph, root: int) -> List[Subtree]:
                 poles=sorted(int(p) for p in poles),
                 branch_root=int(c),
                 boundary_node=int(boundary),
-                entry_edge=(int(boundary), int(c)),
                 entry_edge_id=parent_edge_id.get(c),
                 internal_edge_ids=internal_ids,
             ))

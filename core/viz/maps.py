@@ -257,8 +257,6 @@ def _add_stress_legend(m: folium.Map, scenario_label: str) -> None:
 def _case_topologies(case) -> list:
     if getattr(case, "plan", None) is not None:
         topos = []
-        if case.plan.core_topology is not None:
-            topos.append(case.plan.core_topology)
         topos.extend(z["topology"] for z in case.plan.zones)
         return topos
     if getattr(case, "topology", None) is not None:
@@ -606,8 +604,6 @@ def case_map(
     pole_layer = folium.FeatureGroup(name="Poles", show=False)
     topos = []
     if case.plan is not None:
-        if case.plan.core_topology is not None:
-            topos.append(case.plan.core_topology)
         if getattr(case.plan, "mv_topology", None) is not None:
             topos.append(case.plan.mv_topology)
         topos.extend(z["topology"] for z in case.plan.zones)

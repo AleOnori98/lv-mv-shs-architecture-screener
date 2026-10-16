@@ -32,6 +32,20 @@ CUSTOMER_TYPES = (
 GRID_PRIORITY_TYPES = ("clinic", "hospital", "school", "productive", "water_pump")
 
 
+def _numeric(df: pd.DataFrame, column: str) -> pd.Series:
+    """Coerce ``column`` to numeric, returning an all-NaN Series when it is absent.
+
+    ``DataFrame.get(name)`` returns ``None`` for a missing column, and ``pd.to_numeric(None)``
+    yields a scalar -- so the ``.fillna(default)`` chain this replaces raised
+    ``'numpy.float64' object has no attribute 'fillna'`` whenever an optional column was
+    missing entirely, even though the schema documents a default for exactly that case. Every
+    bundled dataset happens to carry all of them, so it only bit a user's own file.
+    """
+    if column not in df.columns:
+        return pd.Series(float("nan"), index=df.index, dtype=float)
+    return pd.to_numeric(df[column], errors="coerce")
+
+
 def _as_bool(series: pd.Series, default: bool) -> pd.Series:
     truthy = {"true", "t", "yes", "y", "1", "si"}
     falsy = {"false", "f", "no", "n", "0"}
@@ -72,19 +86,33 @@ def normalize_customers(df: pd.DataFrame) -> pd.DataFrame:
         raise ValueError("customers.csv has missing/invalid latitude or longitude values.")
 
     out["customer_type"] = out["customer_type"].fillna("other").astype(str).str.strip().str.lower()
+    # CUSTOMER_TYPES documented the accepted values but nothing checked them, so a typo
+    # ("hosptial") passed through as an unknown type -- and because the standalone-eligibility
+    # default is membership of GRID_PRIORITY_TYPES, that silently made a clinic or a school
+    # SHS-eligible. Warn rather than reject, so unusual local categories still load.
+    unknown = sorted(set(out["customer_type"]) - set(CUSTOMER_TYPES))
+    if unknown:
+        warnings.warn(
+            f"customers.csv: unrecognised customer_type value(s) {unknown}. They are kept as-is, "
+            f"but only {sorted(GRID_PRIORITY_TYPES)} default to grid-only service -- check that an "
+            f"institutional load has not been left stand-alone-eligible by a typo. "
+            f"Known types: {sorted(CUSTOMER_TYPES)}",
+            stacklevel=2,
+        )
 
-    # Numeric loads / parameters with defaults.
-    out["peak_kw_now"] = pd.to_numeric(out.get("peak_kw_now"), errors="coerce").fillna(0.3)
-    out["annual_kwh_now"] = pd.to_numeric(out.get("annual_kwh_now"), errors="coerce")
-    out["annual_kwh_now"] = out["annual_kwh_now"].fillna(out["peak_kw_now"] * 8760.0 * 0.2)
-    out["power_factor"] = pd.to_numeric(out.get("power_factor"), errors="coerce").fillna(0.90).clip(0.5, 1.0)
-    out["growth_rate"] = pd.to_numeric(out.get("growth_rate"), errors="coerce").fillna(0.03)
-    out["demand_tier"] = (
-        pd.to_numeric(out.get("demand_tier"), errors="coerce").fillna(2).round().clip(lower=0).astype(int)
+    # Numeric loads / parameters, with the documented defaults for missing values AND
+    # missing columns.
+    out["peak_kw_now"] = _numeric(out, "peak_kw_now").fillna(0.3)
+    # Default energy from peak at a load factor of 0.2.
+    out["annual_kwh_now"] = _numeric(out, "annual_kwh_now").fillna(out["peak_kw_now"] * 8760.0 * 0.2)
+    out["power_factor"] = _numeric(out, "power_factor").fillna(0.90).clip(0.5, 1.0)
+    out["growth_rate"] = _numeric(out, "growth_rate").fillna(0.03)
+    out["demand_tier"] = _numeric(out, "demand_tier").fillna(2).round().clip(lower=0).astype(int)
+    out["priority_weight"] = _numeric(out, "priority_weight").fillna(1.0)
+
+    out["must_connect_flag"] = _as_bool(
+        out.get("must_connect_flag", pd.Series(index=out.index, dtype=object)), False
     )
-    out["priority_weight"] = pd.to_numeric(out.get("priority_weight"), errors="coerce").fillna(1.0)
-
-    out["must_connect_flag"] = _as_bool(out.get("must_connect_flag", pd.Series(index=out.index, dtype=object)), False)
     out = out.drop(columns=["future_connection_candidate"], errors="ignore")
 
     # can_be_standalone defaults: True for normal households, False for grid-priority types.

@@ -34,11 +34,10 @@ _HULL_MIN_POINTS = 500  # above this cluster size, reduce to convex-hull vertice
 
 @dataclass
 class MVLVPlan:
-    core_topology: Optional[LVTopology]  # kept for builder compatibility; always None here
+    """A costed MV/LV layout: one transformer service zone per customer group, plus the trunk."""
+
     zones: List[Dict[str, Any]] = field(default_factory=list)
     mv_total_length_m: float = 0.0
-    core_customer_ids: List[str] = field(default_factory=list)
-    zone_customer_ids: List[str] = field(default_factory=list)
     mv_topology: Optional[LVTopology] = None
     clustering_criterion: str = ""
     mv_iterations: List[Dict[str, Any]] = field(default_factory=list)
@@ -599,6 +598,4 @@ def build_mvlv_plan(
             z["mv_length_m"] = float(path_len.get(int(pole_id), 0.0) + service_drop_m) if pole_id is not None else 0.0
             mv_total += service_drop_m
 
-    all_ids = sorted({c for z in zones for c in z["customer_ids"]})
-    return MVLVPlan(core_topology=None, zones=zones, mv_total_length_m=mv_total,
-                    core_customer_ids=[], zone_customer_ids=all_ids, mv_topology=mv_topology)
+    return MVLVPlan(zones=zones, mv_total_length_m=mv_total, mv_topology=mv_topology)

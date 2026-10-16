@@ -9,7 +9,7 @@ from types import SimpleNamespace
 
 import pandas as pd
 
-from core.economics.npc import annuity_factor, standalone_npc
+from core.economics.npc import annuity_factor
 from core.economics import cost_model as cm
 from core.workflow.mvp_runner import _avoided_lv_cost
 

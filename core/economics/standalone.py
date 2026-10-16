@@ -18,11 +18,6 @@ class StandaloneChoice:
     reason: str
 
 
-def _horizon_peak(row, horizon_years: int) -> float:
-    """Peak demand at the planning horizon [kW]."""
-    return float(row["peak_kw_now"]) * ((1.0 + float(row["growth_rate"])) ** int(horizon_years))
-
-
 def choose_package_for_customer(
     row: pd.Series,
     packages: pd.DataFrame,

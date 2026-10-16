@@ -118,7 +118,6 @@ def build_mvlv_net(
     plan,
     customers_df,
     *,
-    core_conductor_by_line: Dict[str, Dict[str, Any]],
     zone_conductor_by_line: Dict[str, Dict[str, Any]],
     mv_conductor: Dict[str, Any],
     transformer_by_zone: Dict[str, Dict[str, Any]],
@@ -130,41 +129,20 @@ def build_mvlv_net(
     coincidence_factor: float = 1.0,
     source_vm_pu: float = 1.0,
 ) -> PPModel:
-    """LV core + MV trunk to transformer service zones, fed through an explicit step-up.
+    """MV trunk feeding transformer service zones, energised through an explicit step-up.
 
     ``plan`` is an :class:`core.topology.mvlv_service_zones.MVLVPlan`. A single slack
-    (``ext_grid`` at ``source_vm_pu``, the honest sending voltage) sits on the plant LV bus;
-    an explicit **step-up transformer** lifts it to the MV backbone, which then steps back down
-    at each service zone. This replaces the earlier MVP shortcut of a fixed 1.04 pu slack placed
-    directly on the MV bus with no step-up device.
+    (``ext_grid`` at ``source_vm_pu``, the sending voltage) sits on the plant LV bus; an
+    explicit **step-up transformer** lifts it to the MV backbone, which steps back down at
+    each service zone.
     """
     net = pp.create_empty_network(name="MVLV")
     lookup = customer_lookup(customers_df)
     model = PPModel(net=net)
 
-    # --- Source LV bus (single slack) + optional LV core fed directly at LV ---
-    core = plan.core_topology
-    core_bus_by_pole: Dict[int, int] = {}
-    if core is not None:
-        for pid in core.pole_xy:
-            core_bus_by_pole[int(pid)] = pp.create_bus(net, vn_kv=float(lv_kv), name=f"core_pole_{int(pid)}")
-        source_lv_bus = core_bus_by_pole[core.slack_pole_id]
-        if core.edges_4326 is not None and not core.edges_4326.empty:
-            for _, e in core.edges_4326.iterrows():
-                lid = f"core::{e['line_id']}"
-                cond = core_conductor_by_line[lid]
-                idx = _add_line(net, core_bus_by_pole[int(e["u"])], core_bus_by_pole[int(e["v"])], float(e["length_m"]) / 1000.0, cond, lid)
-                model.line_index_by_id[lid] = idx
-                model.lv_line_ids.append(lid)
-        for pid, cids in core.pole_customers.items():
-            p_kw, q_kw = _pq_kw(cids, lookup, horizon_years, apply_growth, coincidence_factor)
-            if p_kw > 0:
-                pp.create_load(net, bus=core_bus_by_pole[int(pid)], p_mw=p_kw / 1000.0, q_mvar=q_kw / 1000.0)
-                model.total_load_kw += p_kw
-        model.bus_by_pole.update(core_bus_by_pole)
-    else:
-        # Full-settlement zoning (no LV core): a dedicated plant LV bus carries the slack.
-        source_lv_bus = pp.create_bus(net, vn_kv=float(lv_kv), name="source_lv")
+    # Plant LV bus: the one and only slack. Every customer sits in a transformer service
+    # zone, so there is no LV network fed directly at the plant.
+    source_lv_bus = pp.create_bus(net, vn_kv=float(lv_kv), name="source_lv")
 
     # The one and only slack: the plant LV bus at the sending voltage.
     pp.create_ext_grid(net, bus=source_lv_bus, vm_pu=float(source_vm_pu), name="source")

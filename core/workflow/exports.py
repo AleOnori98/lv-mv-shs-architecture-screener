@@ -33,7 +33,6 @@ def case_lines_gdf(case, source: Dict[str, Any]) -> gpd.GeoDataFrame:
             geoms.append(e.geometry)
 
     if case.plan is not None:  # MV/LV
-        add_edges(case.plan.core_topology, "LV", "core", id_prefix="core::")
         for zone in case.plan.zones:
             add_edges(zone["topology"], "LV", zone["zone_id"], id_prefix=f"{zone['zone_id']}::")
         if getattr(case.plan, "mv_topology", None) is not None:

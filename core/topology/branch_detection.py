@@ -14,12 +14,13 @@ from typing import Any, Dict, List, Optional
 
 import pandas as pd
 
-from . import graph_utils as gu
 from .subtree_candidates import terminal_subtrees
 
 
 @dataclass
 class Cluster:
+    """One screened SHS candidate: a terminal subtree with its economics and diagnostics."""
+
     cluster_id: str
     customer_ids: List[str]
     pole_ids: List[int]
@@ -28,15 +29,11 @@ class Cluster:
     boundary_node: int
     n_customers: int
     peak_kw_now: float
-    peak_kw_horizon: float
     annual_kwh_now: float
-    path_length_m: float
-    branch_length_m: float
     branch_cost: float
     branch_cost_per_customer: float
     branch_losses_kw: float
     min_voltage: float
-    max_line_loading: float
     uses_largest_conductor: bool
     standalone_eligible_precheck: bool
     centroid_xy: tuple
@@ -69,7 +66,6 @@ def subtree_clusters(
     g = topology.graph
     root = topology.slack_pole_id
     by_id = customers_df.set_index("customer_id")
-    plengths = gu.path_lengths_from_root(g, root)
     mult = float(cost_params["civil_logistics_multiplier"])
     edge_len_by_lid = {str(d.get("line_id")): float(d["length_m"]) for *_uv, d in g.edges(data=True)}
 
@@ -88,7 +84,6 @@ def subtree_clusters(
             continue
         rows = by_id.loc[[c for c in cust_ids if c in by_id.index]]
 
-        branch_len = sum(edge_len_by_lid.get(lid, 0.0) for lid in edge_ids)
         branch_cost = sum(
             edge_len_by_lid.get(lid, 0.0) * float(conductor_by_line[lid]["cost_per_m"]) * mult
             for lid in edge_ids if lid in conductor_by_line
@@ -96,7 +91,7 @@ def subtree_clusters(
         cost_per_cust = branch_cost / max(len(cust_ids), 1)
         service_drop_m = sum(float(topology.service_drop_m.get(c, 0.0)) for c in cust_ids)
 
-        min_v, max_ll, branch_losses_kw = float("nan"), float("nan"), 0.0
+        min_v, branch_losses_kw = float("nan"), 0.0
         if res_bus is not None and len(res_bus):
             buses = [bus_by_pole[p] for p in poles if p in bus_by_pole]
             if buses:
@@ -104,7 +99,6 @@ def subtree_clusters(
         if res_line is not None and len(res_line):
             idxs = [line_idx[lid] for lid in edge_ids if lid in line_idx]
             if idxs:
-                max_ll = float(res_line.loc[idxs, "loading_percent"].max())
                 branch_losses_kw = max(0.0, float(res_line.loc[idxs, "pl_mw"].sum()) * 1000.0)
 
         uses_largest = any(str((conductor_by_line.get(lid) or {}).get("conductor_id")) == str(largest_conductor_id) for lid in edge_ids)
@@ -118,11 +112,9 @@ def subtree_clusters(
             cluster_id=f"{id_prefix}{i:02d}", customer_ids=sorted(cust_ids), pole_ids=sorted(poles),
             branch_edge_ids=edge_ids, branch_root=int(st.branch_root), boundary_node=int(st.boundary_node),
             n_customers=len(cust_ids), peak_kw_now=float(rows["peak_kw_now"].sum()),
-            peak_kw_horizon=float((rows["peak_kw_now"] * (1.0 + rows["growth_rate"]) ** horizon_years).sum()),
             annual_kwh_now=float(rows["annual_kwh_now"].sum()),
-            path_length_m=float(plengths.get(st.branch_root, 0.0)), branch_length_m=branch_len,
             branch_cost=branch_cost, branch_cost_per_customer=cost_per_cust,
-            branch_losses_kw=branch_losses_kw, min_voltage=min_v, max_line_loading=max_ll,
+            branch_losses_kw=branch_losses_kw, min_voltage=min_v,
             uses_largest_conductor=uses_largest, standalone_eligible_precheck=elig, centroid_xy=cxy,
             metadata={"service_drop_m": service_drop_m},
         )
