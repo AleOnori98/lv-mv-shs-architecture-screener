@@ -866,7 +866,7 @@ def _run_low_voltage_core(
     if roads_available_for_weighting:
         non_empty_roads = gdf_roads[gdf_roads.geometry.notna() & ~gdf_roads.geometry.is_empty]
         if not non_empty_roads.empty:
-            roads_geometry = non_empty_roads.geometry.unary_union
+            roads_geometry = non_empty_roads.geometry.union_all()
     for u_pid, v_pid in mst.edges():
         p_u = final_geom_by_pid.get(int(u_pid))
         p_v = final_geom_by_pid.get(int(v_pid))
@@ -1181,10 +1181,10 @@ def _run_low_voltage_core(
         center = centroid_hint
     else:
         if not gdf_poles_4326.empty:
-            c = gdf_poles_4326.unary_union.centroid
+            c = gdf_poles_4326.union_all().centroid
             center = (c.y, c.x)
         else:
-            c = gdf_buildings_4326.unary_union.centroid
+            c = gdf_buildings_4326.union_all().centroid
             center = (c.y, c.x)
 
     # ------------------------------------------------------------------

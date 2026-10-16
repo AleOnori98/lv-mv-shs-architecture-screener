@@ -44,7 +44,7 @@ def select_projected_crs(
 
     try:
         gdf_4326 = gdf.to_crs(epsg=4326)
-        centroid = gdf_4326.unary_union.centroid
+        centroid = gdf_4326.union_all().centroid
         if centroid.is_empty:
             raise ValueError("Empty centroid geometry.")
         utm_epsg = _utm_epsg_from_lonlat(centroid.x, centroid.y)

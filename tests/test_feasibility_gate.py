@@ -129,3 +129,32 @@ def test_violation_severity_orders_broken_networks():
     # Nothing is worse than a network that cannot be solved at all.
     assert violation_severity(mk(converged=False), CONSTRAINTS) == float("inf")
     assert violation_severity(None, CONSTRAINTS) == float("inf")
+
+
+# --------------------------------------------------------------------------------------
+# Input-contract hygiene: an unrecognised parameter used to be dropped in silence, so a
+# typo answered a different question with no indication anything was wrong.
+# --------------------------------------------------------------------------------------
+def test_unknown_cost_parameter_warns_and_suggests():
+    from core.io.input_schemas import normalize_cost_parameters
+
+    with pytest.warns(UserWarning, match="discount_rate"):
+        out = normalize_cost_parameters({"discount_rte": 0.42})
+    assert out["discount_rate"] == 0.08  # default used, not the typo'd value
+
+
+def test_retired_cost_parameters_stay_silent():
+    """Old datasets still carry retired keys; they load without noise the user can't act on."""
+    import warnings as _w
+    from core.io.input_schemas import normalize_cost_parameters
+
+    with _w.catch_warnings():
+        _w.simplefilter("error")
+        normalize_cost_parameters({"dmax_lv_service_zone_m": 450.0, "lmax_lv_path_m": 700.0})
+
+
+def test_strict_mode_rejects_unknown_parameter():
+    from core.io.input_schemas import normalize_cost_parameters
+
+    with pytest.raises(ValueError, match="unrecognised key"):
+        normalize_cost_parameters({"nonsense_knob": 1.0}, strict=True)

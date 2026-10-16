@@ -1,0 +1,28 @@
+# Byte-compiled / cache
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# Editor / tooling swap files (these were previously committed by accident)
+*.py.tmp.*
+*.orig
+*.rej
+*.swp
+*~
+.DS_Store
+
+# Environments
+.venv/
+venv/
+env/
+.env
+
+# Run outputs (the folder is tracked via outputs/.gitkeep)
+outputs/*
+!outputs/.gitkeep
+
+# Streamlit
+.streamlit/secrets.toml

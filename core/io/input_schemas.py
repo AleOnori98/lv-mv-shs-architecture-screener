@@ -6,6 +6,8 @@ keeps :mod:`core.io.load_inputs` small.
 """
 from __future__ import annotations
 
+import difflib
+import warnings
 from typing import Any, Dict
 
 import numpy as np
@@ -207,10 +209,34 @@ _STRING_PARAMETERS = frozenset({"clustering_criterion"})
 _ALLOWED_CLUSTERING_CRITERIA = frozenset({"voltage_cap", "distance_cap", "capacity"})
 
 
-def normalize_cost_parameters(params: Dict[str, Any]) -> Dict[str, Any]:
+# Parameters that were removed from the engine but may still appear in older input files.
+# They are accepted silently (so existing datasets keep loading) but are not warned about,
+# because the user cannot act on them beyond deleting the row.
+RETIRED_PARAMETERS = frozenset({
+    "dmax_lv_service_zone_m",
+    "lmax_lv_path_m",
+    "remote_branch_length_threshold_m",
+    "loss_threshold_percent",
+})
+
+
+def normalize_cost_parameters(params: Dict[str, Any], *, strict: bool = False) -> Dict[str, Any]:
+    """Fill defaults and coerce types for the cost/engineering parameter table.
+
+    Unrecognised keys used to be dropped in silence, so a typo in ``cost_parameters.csv``
+    (``discount_rte``) was accepted and the default used instead -- the run looked fine and
+    answered a different question. Unknown keys now raise a warning naming the key and the
+    closest known parameter; pass ``strict=True`` to turn that into a hard error.
+    """
     out = dict(COST_PARAMETER_DEFAULTS)
+    unknown: list[str] = []
+    uncoercible: list[str] = []
     for key, value in (params or {}).items():
-        if key not in out or value is None or str(value).strip() == "":
+        if key not in out:
+            if key not in RETIRED_PARAMETERS:
+                unknown.append(str(key))
+            continue
+        if value is None or str(value).strip() == "":
             continue
         if key in _STRING_PARAMETERS:
             out[key] = str(value).strip()
@@ -218,7 +244,33 @@ def normalize_cost_parameters(params: Dict[str, Any]) -> Dict[str, Any]:
         try:
             out[key] = float(value)
         except (TypeError, ValueError):
-            pass
+            uncoercible.append(str(key))
+
+    if uncoercible:
+        msg = (
+            "cost_parameters: non-numeric value(s) ignored for "
+            + ", ".join(sorted(uncoercible))
+            + " (the default was used instead)"
+        )
+        if strict:
+            raise ValueError(msg)
+        warnings.warn(msg, stacklevel=2)
+
+    if unknown:
+        hints = []
+        for key in sorted(unknown):
+            near = difflib.get_close_matches(key, out.keys(), n=1, cutoff=0.7)
+            hints.append(f"{key!r}" + (f" (did you mean {near[0]!r}?)" if near else ""))
+        msg = (
+            "cost_parameters: unrecognised key(s) ignored: "
+            + ", ".join(hints)
+            + ". Known parameters: "
+            + ", ".join(sorted(out.keys()))
+        )
+        if strict:
+            raise ValueError(msg)
+        warnings.warn(msg, stacklevel=2)
+
     crit = str(out.get("clustering_criterion", "voltage_cap"))
     if crit not in _ALLOWED_CLUSTERING_CRITERIA:
         raise ValueError(

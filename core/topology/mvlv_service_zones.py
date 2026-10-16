@@ -53,8 +53,7 @@ def _customer_kva(customers_df: pd.DataFrame, horizon_years: int) -> Dict[str, f
 
 
 def zone_apparent_power_kva(customer_ids: List[str], customers_df: pd.DataFrame, horizon_years: int) -> float:
-    kva = _customer_kva(customers_df, horizon_years)
-    # Coincident apparent power is the vector sum of P and Q, not the sum of |S|; recompute.
+    # Coincident apparent power is the vector sum of P and Q, not the sum of |S|.
     by = customers_df.set_index("customer_id")
     rows = by.loc[[c for c in customer_ids if c in by.index]]
     p = (rows["peak_kw_now"] * (1.0 + rows["growth_rate"]) ** horizon_years)

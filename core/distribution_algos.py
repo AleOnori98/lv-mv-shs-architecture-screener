@@ -842,7 +842,7 @@ def create_graph_and_mst(
     if gdf_roads is not None and not gdf_roads.empty:
         non_empty_roads = gdf_roads[gdf_roads.geometry.notna() & ~gdf_roads.geometry.is_empty]
         if not non_empty_roads.empty:
-            roads_geometry = non_empty_roads.geometry.unary_union
+            roads_geometry = non_empty_roads.geometry.union_all()
 
     # complete graph (OK for a few hundred)
     n = len(pids)

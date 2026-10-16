@@ -1,19 +1,33 @@
+# Conda environment for the LV/MV + stand-alone screener.
+#
+# Version floors, not exact pins: each floor is the version that introduced an API the
+# code actually relies on, so the environment stays installable across platforms while
+# refusing a release that would silently change behaviour. The exact combination the test
+# suite is verified against is pinned in requirements.txt (used by CI).
 name: lvmv-mvp
 channels:
   - conda-forge
 dependencies:
-  - python=3.11
-  - geopandas
-  - shapely
-  - pyproj
-  - networkx
-  - pandas
-  - numpy
-  - folium
-  - streamlit
-  - pyyaml
+  - python >=3.11,<3.14
+  # Geospatial: shapely 2.x / geopandas 1.x for `union_all()` and the 2.x geometry API.
+  - geopandas >=1.0
+  - shapely >=2.0
+  - pyproj >=3.6
+  - numpy >=1.26
+  - pandas >=2.0
+  - networkx >=3.0
+  # scipy: kmeans2(minit="++"), linkage/fcluster, ConvexHull used by the zone partitioners.
+  - scipy >=1.11
+  - folium >=0.15
+  - streamlit >=1.30
+  # altair is imported directly by core/viz/charts.py. It used to be picked up only as a
+  # streamlit transitive dependency, which meant the declared environment did not actually
+  # describe what the code imports.
+  - altair >=5.0
+  - pyyaml >=6.0
   - pip
   - pip:
-      - pandapower
-      - streamlit-folium
-      - pytest
+      # pandapower 3.x: net.converged and the create_*_from_parameters signatures in use.
+      - pandapower >=3.0
+      - streamlit-folium >=0.20
+      - pytest >=8.0
