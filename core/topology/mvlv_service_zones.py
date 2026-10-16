@@ -514,12 +514,21 @@ def build_mvlv_plan(
     *,
     horizon_years: int,
     coincidence_factor: float = 1.0,
+    zone_cache: Optional[Dict[frozenset, Dict[str, Any]]] = None,
 ) -> MVLVPlan:
     """One transformer service zone per customer group; MV trunk = MST over the transformers.
 
     ``coincidence_factor`` is the diversity basis for transformer sizing; pass the same
     value the design power flow uses so the chosen rating and the loading it is checked
     against refer to the same demand.
+
+    ``zone_cache`` memoises the per-zone work (local LV topology, transformer siting and
+    rating) by the zone's customer set. This is only sound because the voltage-cap search
+    walks a NESTED partition family: going from k to k+1 splits exactly one zone, so the
+    other k-1 zones have an identical customer set and an identical local network. Their
+    topology does not depend on k or on the other zones -- each zone's LV tree is rooted at
+    its own transformer -- so recomputing them per attempt was pure waste. The MV trunk
+    depends on the whole set of transformer locations and is never cached.
     """
     crs_epsg = int(crs_meta.get("projected_crs_epsg") or 32633)
     by_ll = customers_df.set_index("customer_id")[["latitude", "longitude"]]
@@ -527,6 +536,18 @@ def build_mvlv_plan(
     zones: List[Dict[str, Any]] = []
     for i, group in enumerate(g for g in zone_groups if g):
         zid = f"Z{i:02d}"
+        cache_key = frozenset(group)
+        cached = zone_cache.get(cache_key) if zone_cache is not None else None
+        if cached is not None:
+            # Same customers => same local LV tree, same transformer. Only the zone id and
+            # the MV attachment differ between attempts.
+            zones.append({
+                **cached,
+                "zone_id": zid, "cluster_id": zid,
+                "transformer_id": f"{zid}_{cached['transformer_spec']['transformer_id']}",
+                "mv_length_m": 0.0,
+            })
+            continue
         sub = customers_engine_gdf[customers_engine_gdf["customer_id"].astype(str).isin(set(group))]
         centroid_xy = (float(sub.geometry.x.mean()), float(sub.geometry.y.mean()))
         # Clip roads to the zone bbox (+ buffer) so the engine only samples poles along nearby
@@ -546,12 +567,19 @@ def build_mvlv_plan(
         )
         s_kva = zone_apparent_power_kva(group, customers_df, horizon_years, coincidence_factor)
         tx = select_transformer(s_kva, transformers_df)
-        zones.append({
+        zone = {
             "zone_id": zid, "cluster_id": zid, "transformer_id": f"{zid}_{tx['transformer_id']}",
             "transformer_spec": tx, "transformer_xy": (float(tx_pt.x), float(tx_pt.y)),
             "transformer_latlon": tx_latlon, "customer_ids": group, "topology": ztopo,
             "s_zone_kva": s_kva, "mv_length_m": 0.0,
-        })
+        }
+        zones.append(zone)
+        if zone_cache is not None:
+            # Store the k-independent part only (ids and the MV attachment are per attempt).
+            zone_cache[cache_key] = {
+                k: v for k, v in zone.items()
+                if k not in ("zone_id", "cluster_id", "transformer_id", "mv_length_m")
+            }
 
     mv_topology = _build_mv_topology(zones, roads_gdf, crs_meta, source, eng)
     mv_total = 0.0

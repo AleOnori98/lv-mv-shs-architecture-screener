@@ -424,19 +424,32 @@ def _build_mvlv_at(ctx, groups: List[List[str]], stepup_spec: Dict[str, Any]) ->
     was formed (capacity packing, distance-cap linkage, or a voltage-cap k-means attempt).
     """
     T, constraints = ctx["T"], ctx["constraints"]
+    # Memoised across k attempts: with a nested partition family, k -> k+1 splits one zone
+    # and leaves the others byte-identical, so their topology and conductor sizing are too.
+    zone_cache = ctx.setdefault("zone_cache", {})
+    sizing_cache = ctx.setdefault("zone_sizing_cache", {})
+
     plan = build_mvlv_plan(
         groups, ctx["gdf"], ctx["roads"], ctx["crs_meta"], ctx["source"], ctx["eng"],
         ctx["customers"], ctx["transformers"], horizon_years=T,
-        coincidence_factor=ctx["tx_coincidence"],
+        coincidence_factor=ctx["tx_coincidence"], zone_cache=zone_cache,
     )
     zone_cond: Dict[str, Any] = {}
     transformers_chosen: List[Dict[str, Any]] = []
     for zone in plan.zones:
         ztopo = zone["topology"]
         ztopo.metadata["lv_kv"] = ctx["lv_kv"]
-        zsizing = _size_flat_lv(ztopo, ctx["customers"], ctx["lv_conductors"], constraints, T, ctx["coincidence"])
-        ztopo.bus_by_pole = zsizing.model.bus_by_pole
-        for lid, c in zsizing.conductor_by_line.items():
+        # Each zone's LV tree is rooted at its own transformer and sized against its own
+        # slack, so the sizing depends only on the zone's customer set (and the catalogue /
+        # constraints, fixed for the run) -- never on k or on the neighbouring zones.
+        cache_key = frozenset(zone["customer_ids"])
+        cached = sizing_cache.get(cache_key)
+        if cached is None:
+            zsizing = _size_flat_lv(ztopo, ctx["customers"], ctx["lv_conductors"], constraints, T, ctx["coincidence"])
+            ztopo.bus_by_pole = zsizing.model.bus_by_pole
+            cached = dict(zsizing.conductor_by_line)
+            sizing_cache[cache_key] = cached
+        for lid, c in cached.items():
             zone_cond[f"{zone['zone_id']}::{lid}"] = c
         transformers_chosen.append({**zone["transformer_spec"], "zone_id": zone["zone_id"], "transformer_id": zone["transformer_id"]})
 
