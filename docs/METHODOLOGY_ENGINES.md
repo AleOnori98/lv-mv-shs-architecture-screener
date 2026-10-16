@@ -155,8 +155,9 @@ source point. Total LV length $= \sum_{e}\ell_e$.
 
 > *"When a single 0.4 kV network can't carry the load without collapsing, we partition the **whole**
 > settlement into transformer zones. The **number of transformers `k` is chosen by a selectable
-> criterion**, not left as a byproduct of packing: `voltage_cap` iterates `k` and lets the power flow
-> pick the **minimum** count that holds the LV voltage drop (backtracking to guarantee minimality);
+> criterion**, not left as a byproduct of packing: `voltage_cap` searches `k` over a **nested** family
+> of partitions and lets the power flow pick the smallest count that holds the LV voltage drop **with a
+> declared margin**, falling back to the smallest merely-feasible count when no count can reach it;
 > `distance_cap` cuts a complete-linkage dendrogram so every cluster diameter is **≤ the cap by
 > construction**; `capacity` is the legacy greedy farthest-first packing. **All three respect the
 > transformer kVA cap** (any cluster exceeding the largest procurable rating is split). Each zone gets
@@ -179,13 +180,34 @@ safety factor:
 
 $$S_{\max}^{\text{zone}} = \frac{\max_t\big(sn^t_{kVA}\cdot \text{max\_loading}^t/100\big)}{1.2}$$
 
-**(a) `voltage_cap` (default) — power-flow-driven, minimal `k`.** Seed `k` at
-`suggest_zone_start` (complete-linkage cluster count at a "hopeless" 2 km diameter — the smallest count
-not doomed by geometry). Each attempt k-means-partitions into `k` zones, enforces the kVA cap, builds
-the full MV/LV network and solves it; the LV voltage cap is exactly the existing feasibility test
-($v_{\min}\ge$ `voltage_min_pu`, i.e. $\Delta V\le 1-$`voltage_min_pu`), with Newton–Raphson divergence
-counted as infeasible. When the seed converges the loop **backtracks** (`k-1, k-2, …`) to return the
-**minimum** count that holds the cap; otherwise it climbs to `max_transformers`.
+**(a) `voltage_cap` (default) — power-flow-driven search over a nested family.** Seed `k` at
+`suggest_zone_start` (complete-linkage cluster count at a "hopeless" 2 km diameter). Each attempt cuts
+**one Ward dendrogram** at `k` (`partition_hierarchical_k`), enforces the kVA cap, builds the full
+MV/LV network and solves it.
+
+The partition family is **nested**: the `k+1` partition *refines* the `k` partition, so a zone is
+split rather than reshuffled. This replaced k-means-per-`k`, which re-solved from scratch at every
+`k` and made the worst voltage drop **non-monotone** in `k` — measured on Mafa, `k=4` gave a 0.1028 pu
+drop against `k=3`'s 0.1004 pu. A search that stops at the first failure cannot rest on that.
+
+A count is **accepted** at $v_{\min}\ge$ `voltage_min_pu` $+$ `design_voltage_margin_pu` (default
+0.02 pu), not merely at the feasibility limit: minimising `k` against the bare limit spends every volt
+of headroom and leaves the accepted design sitting on the constraint (0.913 pu against a 0.90 limit,
+measured).
+
+The margin is a **preference, not a constraint**. More transformers shorten LV feeders but lengthen
+the MV trunk and insert another transformer impedance, so the achievable voltage **plateaus** — on
+Mafa no zone count reaches a 0.92 pu target. When the margin is unreachable the search returns the
+**smallest merely-feasible** count and records why; with nothing feasible it reports the
+least-violating partition. `k` never exceeds the customer count (the old climb was bounded only by
+`max_transformers` and crashed out of the partitioner on any smaller settlement); diverged attempts
+step geometrically; and the climb stops once extra transformers stop buying voltage — but only once
+something feasible is in hand, because on Mafa the voltage sits flat at 0.884 pu for `k=4..7` and then
+*jumps* to 0.905 at `k=10`, so flat is not saturated. `k_selection_snapshot="coincident"` selects
+against the coincident peak instead.
+
+The search is the dominant runtime cost: one full plan build, per-zone sizing loop and MV rank sweep
+per attempted `k`, for Case C and again for Case D (~240 s for 240 customers without numba).
 
 **(b) `distance_cap` — geometric guarantee, one-shot.** Complete-linkage hierarchical clustering cut at
 `max_cluster_diameter_m`, so every cluster diameter is **≤ the cap by construction**; `k` emerges from
@@ -249,10 +271,10 @@ rebuilding and re-solving the full network until it is feasible.
 | Assumption | Consequence |
 |---|---|
 | **Explicit step-up transformer** (updated) | Single slack on the **plant LV bus** at `source_vm_pu` (default 1.0); an explicit LV→MV step-up feeds the MV backbone with real impedance. Retires the fixed 1.04-pu-on-MV-bus shortcut (the OLTC is still not modelled). |
-| **`k` chosen by criterion** (updated) | `voltage_cap` picks the **minimum** `k` the power flow allows (backtracking); `distance_cap` guarantees cluster diameter ≤ cap; `capacity` is the legacy packing. The kVA cap is enforced under all three. Zones still ignore *joint* MV-length minimisation. |
+| **`k` chosen by criterion** (updated) | `voltage_cap` searches a **nested** Ward family for the smallest `k` holding the voltage limit **plus a declared margin**, falling back to the smallest feasible `k` when the margin is unreachable; `distance_cap` guarantees cluster diameter ≤ cap; `capacity` is the legacy packing. The kVA cap is enforced under all three. Zones still ignore *joint* MV-length minimisation. |
 | Transformer at **unweighted centroid** | Not the kVA-weighted load centroid, so intra-zone LV $\Delta V$ isn't minimised by placement. |
-| Sizing on **coincident $cf=1.0$**, network validated at **$cf=0.6$** | Transformer is rated for a harsher peak than the LV design PF it's checked against (deliberately conservative — but a documented mismatch). |
-| **Double 1.2 margin** | 1.2 in `S_max^zone` (cap) *and* 1.2 in `select_transformer` (target). Combined headroom is large. |
+| Sizing on **coincident $cf=1.0$**, network validated at **$cf=0.6$** | Now an explicit parameter (`transformer_sizing_coincidence_factor`), not a hard-coded constant. The rating is $1/cf$ larger than the snapshot it is checked against, so its loading peaks near 50% and the loading limit cannot bind. Tracking the design factor instead is **not** simply better: `coincidence_factor` is flat and system-wide, diversity only emerges with many customers, so it under-sizes small zones — and a smaller unit has a *higher* ohmic impedance ($v_k\%/sn$), costing ~0.010 pu of LV voltage (measured: it flipped Case D from feasible to infeasible). A size-dependent ADMD curve is the real fix. |
+| **One 1.2 margin, two uses** (corrected) | The 1.2 in `S_max^zone` and the 1.2 in `select_transformer` are the **same** margin, not a compounded 1.44: the cap exists so a zone sitting at the cap stays coverable by the largest catalogue unit. Named `TRANSFORMER_SIZING_SAFETY_FACTOR`. |
 | **One MV conductor for the whole trunk** | No per-segment MV sizing; coarse but simple. |
 | Bus–bus **switch** ties trafo LV to slack pole | Zero-impedance tie; no LV busbar / no in-zone MV reticulation. |
 | Single **radial** MV feeder, one source | No ring / no backup / no second injection. |
@@ -260,25 +282,34 @@ rebuilding and re-solving the full network until it is feasible.
 
 ### 2.6 Open questions for the supervisor (Engine 2)
 
-> **Update.** Q1 and (partly) Q2/Q4 below are now **addressed** in code: an explicit step-up
-> transformer with a single LV-bus slack replaces the 1.04 pu MV shortcut; `k` is chosen by a
-> `voltage_cap` power-flow search (minimal `k`, backtracked) or a `distance_cap` diameter guarantee,
-> both kVA-capped; and the double sizing margin is reduced (single margin on the step-up). The
-> remaining nuances (OLTC / X_source, *jointly* minimising MV length, loss-driven sizing) are still open.
+> **Update.** Q1 is **addressed** (explicit step-up, single LV-bus slack). Q2 is **partly**
+> addressed: `k` now comes from a power-flow search over a *nested* Ward family with a declared
+> voltage margin and a documented fallback, or from a `distance_cap` diameter guarantee, both
+> kVA-capped — but zones are still not formed by *jointly* minimising MV trunk length. Q4 is
+> **reframed, not closed**: the sizing coincidence basis is now an explicit parameter and the "double
+> margin" turned out to be one margin used consistently, but the flat-vs-zone-scale diversity problem
+> underneath it is real and needs a size-dependent ADMD curve. OLTC / $X_{source}$ and loss-driven
+> sizing remain open.
 
 1. **~~The 1.04 pu source & missing step-up transformer.~~ (addressed)** The step-up is now explicit and
    the slack sits on the plant LV bus at the sending voltage. Remaining: what sending voltage /
    `X_source` / OLTC behaviour to assume for the upstream primary substation?
 2. **Geometric vs. electrical zoning. (partly addressed)** `voltage_cap` now sets `k` from the actual
-   power flow and `distance_cap` from a hard diameter bound; zones are still not formed by *jointly*
-   minimising MV trunk length. Is the k-means/linkage + backtracking sufficient, or move to a proper
-   capacitated facility-location / K-median with an explicit MV-length objective?
+   power flow over a nested partition family, and `distance_cap` from a hard diameter bound; zones are
+   still not formed by *jointly* minimising MV trunk length. Is a Ward cut + margin search sufficient,
+   or move to a proper capacitated facility-location / K-median with an explicit MV-length objective?
+   Note the measured plateau: past ~10 zones on Mafa, extra transformers buy no voltage because the
+   binding drop has moved to the MV trunk and the step-up — which suggests the MV side, not the
+   zoning, is where the remaining headroom is.
 3. **Transformer siting.** Centroid-snapped-to-road vs. **kVA-weighted load centroid** (which
    minimises $\sum kVA\cdot\ell$ inside the zone). Is the LV voltage penalty of the unweighted
    centroid material?
-4. **Double safety margin & coincidence mismatch.** Sizing at $cf=1.0$ **and** capping at
-   derated/1.2 **and** targeting 1.2·S: is the stacked conservatism justified, or is it oversizing
-   transformers (and inflating the MV/LV NPC unfairly vs. LV)?
+4. **Coincidence basis for transformer sizing. (reframed)** The cap and the sizing target share one
+   1.2 margin, so there is no stacked 1.44. What remains is the real question: `coincidence_factor` is
+   a single flat system-wide number, so neither $cf=1.0$ (over-sizes, loading limit never binds) nor
+   $cf=cf_{design}$ (under-sizes small zones, costs LV voltage) is right at zone scale. What
+   size-dependent ADMD / diversity curve should set the sizing peak as a function of the number of
+   aggregated customers?
 5. **Discrete catalogue & losses in sizing.** Transformer choice ignores its own no-load ($p_{fe}$)
    and load losses in the *economic* sizing — only the CAPEX ($\text{cost\_fixed}+\text{cost\_per\_kVA}\cdot sn$)
    enters. Should lifetime loss cost drive the sizing/selection, not just the loading constraint?
@@ -377,7 +408,8 @@ global optimum. After selection, the grid is **rebuilt and resized** on the rema
 | Candidate unit = **terminal subtree** | Decisions are per **leaf branch**, never per customer and never the whole zone. Nested laminar family. |
 | Decision is **purely economic** | Engineering "remoteness" thresholds are diagnostics only; the gate is $\text{NPC}_{\text{SA}}<\text{avoided}$. |
 | **Marginal** avoided cost on the **pre-removal** network | Branch losses/voltages come from the *original* solved PF; the ordering doesn't re-solve after each cut. |
-| Case D **omits** losses + transformer/MV credit | Under-credits SHS in the MV/LV screen ⇒ conservative (fewer SHS chosen). |
+| Case D **omits** losses + transformer/MV credit | Under-credits SHS in the MV/LV screen ⇒ conservative. In practice it no longer restrains anything: the gate accepts **every** candidate branch (22/22 on Mafa) because avoided generation dominates. |
+| Service drops **credited and charged** (fixed) | The avoided cost credited avoided service drops while no candidate NPC charged them, so the gate was paid for a saving the objective did not recognise. Both sides now call the same helper on the same metres. |
 | Avoided cost **credits avoided grid *generation*** (updated) | Both screens now credit the PV of grid generation LCOE the departing customers no longer draw — the largest previously-missing term. This makes the gate the true break-even and selects more SHS; a residual marginal-vs-joint gap in the *topology* terms remains (see §3.6 Q2). |
 | SHS = **catalogue package**, not a dispatch model | No solar resource, battery autonomy, or reliability modelling; NPC via capex+O&M+replacement−salvage. |
 | Grid generation priced at **flat 0.25 MU/kWh LCOE** | This term **dominates** total NPC and drives the grid-vs-SHS balance; high sensitivity. |
@@ -415,13 +447,15 @@ global optimum. After selection, the grid is **rebuilt and resized** on the rema
 | **Unit built** | Poles, drops, radial LV MST | Zones, transformers, MV MST | Terminal subtrees (leaf branches) |
 | **Driving objective** | Min (penalised) **length** | Min LV radius + kVA cap | **Economic**: NPC_SA < avoided |
 | **Electrical role** | Reconductoring repairs $\Delta V$/loading | 11 kV evacuation to derated transformers | Carve off branches cheaper off-grid |
-| **Key simplification** | Geometry≠electrics; drops impedance-free; balanced 3-φ | Explicit step-up (slack 1.0 pu on LV); `k` by criterion (voltage/distance cap, kVA-capped); centroid siting | Marginal/greedy; omits loss & generation credit (D) |
-| **Biggest open question** | Length-MST as a loss/voltage proxy | Sending voltage/OLTC; *jointly* MV-length-optimal zoning | Conservative biases against SHS; marginal≠joint |
+| **Key simplification** | Geometry≠electrics; drops impedance-free; balanced 3-φ | Explicit step-up (slack 1.0 pu on LV); `k` by nested search + voltage margin, kVA-capped; centroid siting | Marginal/greedy; omits loss & TX/MV credit (D) |
+| **Biggest open question** | Length-MST as a loss/voltage proxy | Flat `cf` at zone scale (needs ADMD); sending voltage/OLTC; *jointly* MV-length-optimal zoning | The flat LCOE: it dominates NPC and the gate now accepts every branch |
 
 **Closing speech line:** *"Each engine is a fast, deterministic geometric heuristic with a thin
 electrical validation layer bolted on afterwards. That makes the whole comparison tractable across
 four architectures and many settlements — but it means every 'electrical' result is really a
 *geometry that survived a power-flow check*, not a geometry chosen to optimise the electrics. The
 questions I most want your view on are exactly the seams where that shortcut might bite: the
-length-vs-loss topology, the missing step-up transformer and the 1.04 pu slack, and the conservative
-avoided-cost that may be under-selecting the hybrid solar pockets."*
+length-vs-loss topology, the diversity assumption that a single flat coincidence factor has to carry
+at both system and zone scale, and — above all — the flat generation LCOE, which is 63–85% of every
+NPC, identical between network architectures, and now so dominant that the SHS screen accepts every
+branch it is offered."*

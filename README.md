@@ -1,7 +1,7 @@
 # LV/MV + Stand-alone Mini-Grid MVP
 
 A lightweight, interactive **Streamlit** tool that compares four rural electrification
-architectures for a settlement and recommends one by **least-feasible net present cost (NPC)**:
+architectures for a settlement and recommends the lowest-NPC **feasible** one:
 
 - **A — Full LV**: every customer on one low-voltage network.
 - **B — LV + Stand-alone**: terminal **leaf branches** cheaper to serve off-grid become solar
@@ -18,7 +18,10 @@ It reuses a road-pole + **MST** topology engine and validates every network with
 > **This MVP is a sequential diagnostic workflow, not a full co-optimization model.**
 
 📖 **Docs:** [`docs/WORKFLOW.md`](docs/WORKFLOW.md) — plain-language, step-by-step walkthrough ·
-[`docs/MODEL_REFERENCE.md`](docs/MODEL_REFERENCE.md) — exact parameters, variables & equations.
+[`docs/MODEL_REFERENCE.md`](docs/MODEL_REFERENCE.md) — exact parameters, variables & equations ·
+[`docs/METHODOLOGY_ENGINES.md`](docs/METHODOLOGY_ENGINES.md) — the three engines, engine by engine ·
+[`docs/PIPELINE_REVIEW.md`](docs/PIPELINE_REVIEW.md) — **known weaknesses and maturity assessment
+(read this before citing a number)**.
 
 ---
 
@@ -53,10 +56,21 @@ CSV / GeoJSON ─▶ load_inputs ─▶ customers_to_engine_gdf
    and — for the LV screen — loss costs). Case D runs the same screen **per MV/LV zone**.
 5. Build the four candidate architectures and validate each at present and horizon demand, plus a
    **coincident-peak stress** snapshot (every customer at their peak at once) reported for robustness.
-6. Compare by NPC — which now includes the **mini-grid generation cost** (a levelised LCOE on grid-served
-   energy, so grid and stand-alone are costed on the same footing) — and report a recommendation, a
-   per-customer strategy table, a decision log, a **tier-served / future-expansion** view, coincident-peak
-   stress indicators, and a **parallel-coordinates** trade-off plot of the feasible solutions.
+   For MV/LV, the **number of transformers is searched**: nested Ward partitions, accepted only with a
+   declared voltage margin, falling back to the smallest feasible count when that margin is
+   unreachable.
+6. Compare by NPC — including the **mini-grid generation cost** (a levelised LCOE on grid-served
+   energy, so grid and stand-alone are costed on the same footing) and the **service drops** — and
+   report a recommendation, a per-customer strategy table, a decision log, a **tier-served /
+   future-expansion** view, coincident-peak stress indicators, and a **parallel-coordinates** trade-off
+   plot of the feasible solutions.
+
+> ⚠️ **The generation LCOE dominates.** On every bundled case study `generation_npc` is **63–85% of
+> `total_npc`**, and it is *identical between network architectures* (A and C agree to the euro) —
+> so it cannot discriminate LV from MV/LV while completely setting the grid-vs-SHS balance. The SHS
+> screen currently accepts **every** candidate branch on the real cases. Treat the architecture
+> ranking as indicative until a generation model replaces the flat LCOE; see
+> [`docs/PIPELINE_REVIEW.md`](docs/PIPELINE_REVIEW.md) §3.1.
 
 ---
 
@@ -105,7 +119,13 @@ page's dataset selector.
 | **Synthetic demo** (`examples/mvp/`) | 60 customers, ~15 s | Dense core + remote leaf branches + institutional cluster → **B (LV + Stand-alone)** wins (≈13 customers moved off-grid) |
 | **NGA 1 compact village** (`examples/nga_1/`) | 128 customers, ~15 s | Real Nigerian customer coordinates + OSM roads, with aggregate village demand distributed across households. Compact layout — **A** and **B** are essentially tied; **B (LV + Stand-alone)** edges A by moving one remote customer off-grid |
 | **Mafa case study, NGA** (`examples/mafa case study/`) | 240 customers, ~1.5 min | Real field-survey coordinates + customer types + OSM roads. Flat LV is infeasible; **D (MV/LV + Stand-alone)** wins, moving ≈16 leaf-branch customers off-grid and serving the rest with transformer zones |
-| **Realistic SSA village** (`examples/complete/`) | 521 customers, ~2.5 min | Real coordinates, customer types and OSM roads. Flat LV collapses (infeasible); among feasible candidates **D (MV/LV + Stand-alone, ~15 transformer zones)** narrowly edges **C** |
+| **Realistic SSA village** (`examples/complete/`) | 521 customers, several min | Real coordinates, customer types and OSM roads. Flat LV collapses (infeasible) |
+
+> The "what it shows" column describes the qualitative behaviour. **Specific winners, NPCs and SHS
+> counts move with the model** — they changed substantially in the correctness pass documented in
+> [`docs/PIPELINE_REVIEW.md`](docs/PIPELINE_REVIEW.md). Re-run before citing; the current measured
+> figures for Mafa and NGA-dense are in
+> [`docs/CASE_STUDY_COMPARISON.md`](docs/CASE_STUDY_COMPARISON.md).
 
 Regenerate them deterministically:
 
@@ -121,9 +141,10 @@ are kept as GIS references for future use.
 
 Smoke-test any dataset end-to-end: `python scripts/smoke_dataset.py mafa` (or `mvp` / `complete`).
 
-Run the tests:
+Run the tests (CI runs the same suite plus a check that no build artefacts are committed):
 
 ```bash
+pip install -r requirements.txt     # exact versions the suite is verified against
 python -m pytest tests/ -q
 ```
 
@@ -162,8 +183,12 @@ customer-strategy table, a decision log, four candidate maps (customers colored 
 `pandapower_validation_results.csv`, and `all_outputs.zip`).
 
 **Interpreting it:** the recommended candidate is the **feasible** one with the lowest
-`npc_total`; if none is feasible, the least-infeasible candidate and its active bottleneck are
-reported. The decision log records every leaf-branch / customer decision with the driving metric.
+`npc_total`. If none is feasible the fallback ranks by **violation severity**, not cost — a diverged
+candidate has no computable loss cost, so its total is a lower bound and ranking by NPC would pick
+the most broken candidate. Any candidate with `npc_complete = False` is missing a cost component
+(named in `npc_missing_components`) and its total is a lower bound, not a comparable cost. The
+decision log records every leaf-branch / customer decision with the driving metric, and every
+attempted transformer count with the voltage target it was judged against.
 
 ---
 
@@ -171,22 +196,37 @@ reported. The decision log records every leaf-branch / customer decision with th
 
 - Balanced three-phase approximation only; no unbalanced/phase allocation.
 - Single fixed source/injection point.
-- Topology via road-pole + MST heuristic (Euclidean distances; roads seed pole locations).
+- Topology via road-pole + MST heuristic (Euclidean distances; roads seed pole locations). The
+  backbone minimises **length**, not voltage drop or losses — the electrics are repaired afterwards
+  by reconductoring, never by moving a wire.
+- Service drops are **costed but carry no impedance** (loads sit on the pole bus).
+- Cases C and D are built over Case A's served customers, so anyone the flat-LV engine could not
+  reach cannot be served by MV/LV either.
 - Stand-alone decisions are leaf-branch-level (a whole terminal subtree is kept or cut), not exact
   per-customer optimization.
 - MV/LV uses heuristic capacity-based zoning (greedy farthest-first, bounded by zone radius and
   transformer rating) with transformer placement at the zone centroid (road-snapped) — not a
   facility-location optimizer. A small fraction of customers may remain unserved inside a zone
   (reported as `service_tier_violations`).
-- The MV source/slack is set at a realistic high sending voltage (~1.04 pu) to offset MV +
-  transformer drop; no explicit step-up transformer is modelled.
+- MV/LV uses a **single slack on the plant LV bus** plus an **explicit step-up transformer**. The
+  flat-LV cases get an ideal 0.4 kV slack with no plant transformer, which is an asymmetry in their
+  favour. No OLTC or upstream source impedance is modelled.
 - Demand diversity is a **single flat coincidence factor** for the whole system (no size-dependent
   ADMD); the network is designed at that diversified peak and stress-tested at the coincident peak.
+  Transformers are sized on a separate, explicit basis
+  (`transformer_sizing_coincidence_factor`, default 1.0) because a flat *system-wide* factor is not
+  valid at single-zone scale — a size-dependent ADMD curve is the real fix.
 - Demand growth is stress-tested through horizon power-flow validation, not optimized dynamically; a
   single peak-power snapshot is used (no hourly/time-series dispatch).
-- Mini-grid generation is costed with **one flat LCOE** applied to grid-served energy — a proxy for a
-  dispatch/generation model, not an hourly production simulation.
-- Cost values are illustrative unless replaced with local data.
+- Mini-grid generation is costed with **one flat LCOE** applied to grid-served energy (and, by
+  default, to its losses) — a proxy for a dispatch/generation model, not an hourly production
+  simulation. It has **no economies of scale**, which is why the SHS screen no longer discriminates.
+- SHS packages carry **no reliability / autonomy term**, so a grid connection and an SHS are compared
+  on cost alone without equalising service quality.
+- Avoided costs are **marginal estimates on the pre-removal network** while each candidate is a full
+  rebuild (Case D even re-partitions from scratch), so realised savings differ from credited ones.
+- Cost values are illustrative unless replaced with local data; **no bundled dataset sets
+  `generation_lcoe_per_kwh`**, so every published number rests on the 0.25 default.
 
 ---
 

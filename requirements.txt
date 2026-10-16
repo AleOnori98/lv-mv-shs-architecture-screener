@@ -12,3 +12,5 @@ folium==0.20.0
 altair==6.3.0
 PyYAML==6.0.3
 pytest==9.1.1
+# scripts/compare_case_studies.py only (figure generation)
+matplotlib==3.11.2

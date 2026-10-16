@@ -25,6 +25,8 @@ dependencies:
   # describe what the code imports.
   - altair >=5.0
   - pyyaml >=6.0
+  # scripts/compare_case_studies.py only (figure generation)
+  - matplotlib >=3.7
   - pip
   - pip:
       # pandapower 3.x: net.converged and the create_*_from_parameters signatures in use.

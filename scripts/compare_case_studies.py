@@ -39,14 +39,17 @@ TYPE_COLORS = {
     "mosque": "#54A24B", "productive": "#B279A2", "shop": "#EECA3B",
     "public_service": "#72B7B2",
 }
+# Must cover every component of CostBreakdown, or the figure silently understates NPC.
 COMPONENTS = [
     ("lv_line_cost", "LV lines", "#4C78A8"),
     ("mv_line_cost", "MV lines", "#E45756"),
     ("pole_cost", "Poles", "#9D755D"),
     ("transformer_cost", "Transformers", "#F58518"),
     ("connection_metering_cost", "Connection/metering", "#54A24B"),
+    ("service_drop_cost", "Service drops", "#7F7F7F"),
     ("standalone_npc", "Stand-alone (SHS)", "#B279A2"),
     ("loss_pv_cost", "Losses (PV)", "#BAB0AC"),
+    ("generation_npc", "Generation (LCOE)", "#72B7B2"),
 ]
 
 

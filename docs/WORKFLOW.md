@@ -1,8 +1,9 @@
 # Workflow — Plain-Language Walkthrough
 
-How the simplified LV/MV + stand-alone MVP runs, end to end: what each stage does, the data passed
-between stages, the iterative loops, and where a step declares **infeasible**. For exact equations and
-parameter defaults see [`MODEL_REFERENCE.md`](MODEL_REFERENCE.md).
+How the simplified LV/MV + stand-alone workflow runs, end to end: what each stage does, the data
+passed between stages, the iterative loops, and where a step declares **infeasible**. For exact
+equations and parameter defaults see [`MODEL_REFERENCE.md`](MODEL_REFERENCE.md); for the known
+weaknesses see [`PIPELINE_REVIEW.md`](PIPELINE_REVIEW.md).
 
 **The big idea in one sentence.** Take a village of customers, draw four ways to electrify it — full
 low-voltage grid (**A**), full LV with some houses on solar (**B**), a medium-voltage backbone feeding
@@ -19,11 +20,11 @@ flowchart TD
   CLEAN --> PROJ["2 Project + engine schema"]
   PROJ --> ENG["3 Topology engine (poles, association, MST, drops)"]
   ENG --> A["A Full LV — build + size (loop)"]
-  ENG --> C["C MV/LV zones — partition + size (loops) + MV trunk"]
+  ENG --> C["C MV/LV zones — zone-count search + size (loops) + MV trunk"]
   A --> LVS["LV SHS screen — leaf subtrees to economics"]
   LVS --> B["B LV + SHS — rebuild + size (loop)"]
   C --> MVS["MV/LV SHS screen — per-zone subtrees to economics"]
-  MVS --> D["D MV/LV + SHS — rebuild zones (loop)"]
+  MVS --> D["D MV/LV + SHS — re-partition + rebuild (loop)"]
   A --> EVAL["Feasibility + service obligations"]
   B --> EVAL
   C --> EVAL
@@ -45,12 +46,18 @@ Stages 1–3 run **once** and feed every candidate. `A → LV screen → B` and 
   `transformers.csv`, `standalone_packages.csv`, `cost_parameters` (CSV/YAML), optional `roads`.
 - **What it does (`normalize_*`):** enforces required columns; coerces numerics; **fills defaults**
   for anything missing (e.g. `peak_kw_now=0.3`, `annual_kwh_now = peak·8760·0.2`, `power_factor=0.90`
-  clamped to [0.5,1.0], `growth_rate=0.03`, `demand_tier=2`); derives flags — `can_be_standalone_flag`
-  defaults `True` except grid-priority types (`clinic, hospital, school, productive, water_pump`), and
-  **`must_connect ⇒ can_be_standalone=False`**. `cost_parameters` are back-filled from
-  `COST_PARAMETER_DEFAULTS`.
+  clamped to [0.5,1.0], `growth_rate=0.03`, `demand_tier=2`); derives flags —
+  `can_be_standalone_flag` defaults `True` except grid-priority types (`clinic, hospital, school,
+  productive, water_pump`), and **`must_connect ⇒ can_be_standalone=False`**. `cost_parameters` are
+  back-filled from `COST_PARAMETER_DEFAULTS`.
 - **Hard stop (run never starts), raises `ValueError`:** missing required columns; **duplicate
-  `customer_id`**; missing/invalid latitude or longitude.
+  `customer_id`**; missing/invalid latitude or longitude; an out-of-range `clustering_criterion` or
+  `k_selection_snapshot`.
+- **Warns:** an **unrecognised** cost-parameter key, with a did-you-mean suggestion. These used to be
+  dropped in silence, so a typo (`discount_rte`) was accepted, the default was used, and the run
+  looked fine while answering a different question. Four **retired** keys
+  (`dmax_lv_service_zone_m`, `lmax_lv_path_m`, `remote_branch_length_threshold_m`,
+  `loss_threshold_percent`) are still accepted quietly so older datasets keep loading.
 - **Dependency:** every later stage consumes these cleaned tables; the cost/engineering parameters fan
   out to sizing, costing, and the SHS screens.
 
@@ -65,6 +72,10 @@ topology engine expects.
   stable string `customer_id`.
 - **Dependency:** all topology building runs in this projected frame, so `service_drop_m`, branch
   lengths and zone radii are all in metres.
+
+Alongside this, `build_context` assembles the run context every costing helper reads — the per-customer
+energy and growth lookups, the resolved transformer-sizing coincidence basis, the constraint set. It is
+one builder so the contract lives in one place.
 
 ## Stage 3 — Topology engine (shared by every candidate)
 *`core/topology/lv_topology.py` → reuses `core.distribution_service._run_low_voltage_core`*
@@ -82,6 +93,8 @@ a tree.
   MV/LV zone**, and the **MV trunk** (transformers treated as pseudo-customers).
 - **Soft infeasibility:** unserved customers propagate to "service-tier violations" downstream and are
   drawn grey on the result map.
+- The backbone minimises **length** (an MST), not voltage drop or losses; the electrics are repaired
+  afterwards by reconductoring. Service drops are **priced but carry no impedance**.
 
 ---
 
@@ -103,9 +116,12 @@ doesn't overload or sag.
   or **2 consecutive non-convergences** → early bail (voltage collapse can't be reconductored away).
 - **Feasible** (`run_powerflow`) iff PF converged **and** `min_vm ≥ v_min`, `max_vm ≤ v_max`,
   `max_line_loading ≤ limit`, `max_trafo_loading ≤ limit`; otherwise `active_bottleneck` names the breach.
-- **Then costs** (`cost_model.py`): LV line + poles + connection/metering + present value of losses +
-  **mini-grid generation** (`generation_lcoe_per_kwh · grid-served annual kWh · AF`, so grid energy is
-  costed the same way SHS energy already is inside its package — no double count).
+  A non-converged solve returns every metric as `NaN` and **no limit check runs** — a `NaN` comparison
+  is always `False` and would otherwise read as "within limits".
+- **Then costs** (`cost_model.py`): LV line + poles + connection/metering + **service drops** +
+  present value of losses + **mini-grid generation**. Both energy streams are levelised over their
+  actual growth trajectory; losses are priced at the generation LCOE, because loss energy is generated
+  energy that never arrives.
 - **Three PF snapshots are stored:** **now** (reference), **horizon design** (binding, `cf`-diversified),
   and a **coincident-peak stress** snapshot (`cf = 1.0`, everyone at once) — reported as a robustness
   check, never gating feasibility.
@@ -121,37 +137,61 @@ them, cut them loose.
   with ≥ 2 children; each child's downstream **subtree** is a candidate "leaf branch". Trunks and the
   whole network are excluded by construction; subtrees **nest** and form a laminar family.
 - **Per-branch economics:**
-  - **Avoided grid cost** (`_avoided_lv_cost`) = branch line cost (internal + entry edge) + service-drop
-    proxy (cheapest LV conductor) + connection/metering + **all** dedicated poles + PV of that branch's
-    losses (from A's power flow).
-  - **SHS NPC** (`standalone.cluster_standalone` → `npc.standalone_npc`) = per-customer cheapest feasible
-    solar package summed: `NPC = capex + PV(O&M) + PV(replacements) − PV(salvage)`.
+  - **Avoided grid cost** (`_avoided_lv_cost`) = branch line cost (internal + entry edge) + service
+    drops + connection/metering + **all** dedicated poles + avoided grid **generation** + PV of that
+    branch's losses. Every term calls the **same helper** the candidate NPC charges, so the gate
+    cannot be paid for a saving the objective does not recognise.
+  - **SHS NPC** (`standalone.cluster_standalone` → `npc.standalone_npc`) = per-customer cheapest
+    feasible solar package summed: `NPC = capex + PV(O&M) + PV(replacements) − PV(salvage)`. Package
+    eligibility sizes **both** peak and energy at the horizon and allows a small
+    `standalone_sizing_tolerance` (default 2%), because the catalogue is discrete and the exact test
+    was a knife edge.
 - **Decision (purely economic, greedy):** evaluate candidates **largest-avoided-first**; skip a branch
   whose customers are already claimed (handles nesting); select **iff `SHS_NPC < avoided`**. Engineering
-  thresholds (branch cost/customer, undervoltage, largest-conductor) are **diagnostic flags only**;
-  `dmax`/`lmax` were removed.
+  thresholds are **diagnostic flags only**.
 - **Blocked (cannot be pruned):** any customer is `must_connect` or `¬can_be_standalone`; or **no
   package** satisfies tier/peak/energy.
 - **Candidate B (`_run_lv_standalone`):** remove the selected SHS customers, **rebuild the LV topology
   on the remainder, re-run the sizing loop**, re-cost; SHS NPC folds into B's total. If nothing was
   selected, B = A.
 
+> **Known limitation.** On the real case studies this gate accepts **every** candidate branch (17/17
+> in B, 22/22 in D on Mafa, moving 139–153 of 240 customers off-grid). Avoided generation dominates
+> the avoided cost and a flat LCOE has no economies of scale, so nothing restores the balance as load
+> leaves the grid. See [`PIPELINE_REVIEW.md`](PIPELINE_REVIEW.md) §3.1.
+
 ## Stage 6 — Candidate C (MV/LV service zones) + nested sizing loops
-*`mvlv_service_zones.py` + `_run_mvlv` + `_build_mvlv`*
+*`mvlv_service_zones.py` + `_run_mvlv` + `_build_mvlv` + `_voltage_cap_search`*
 
 **Plain words:** for a big/spread village a single LV grid collapses, so split it into transformer
-"neighborhoods" fed by an MV backbone.
+"neighborhoods" fed by an MV backbone, and let the power flow decide how many you need.
 
-- **Partition (`partition_service_zones`, greedy farthest-first):** seed = customer farthest from
-  source; grow by nearest customers while `dist ≤ max_lv_zone_radius_m`, `members < max_zone_customers`,
-  and coincident `S ≤ max_zone_kva` (largest transformer derated ÷ 1.2); repeat until all assigned.
-  Every grid customer lands in exactly one zone.
-- **Per zone:** transformer at the zone centroid (snapped to road); a **local LV tree** (Stage 3) → its
-  own **sizing loop**; transformer = smallest rank with `sn·max_loading%/100 ≥ 1.2·S_zone`.
+- **How many transformers?** `clustering_criterion` decides. The default `voltage_cap` **searches** the
+  zone count:
+  - the partition family is a **Ward dendrogram cut at `k`**, so `k+1` **refines** `k` (a zone is
+    split, never reshuffled). The previous k-means-per-`k` re-solved from scratch, which made the
+    worst voltage drop non-monotone in `k` — something a search that stops at the first failure
+    cannot rest on;
+  - a count is **accepted** only with a **declared voltage margin** on top of the limit
+    (`design_voltage_margin_pu`, default 0.02 pu), so the chosen design is not left sitting on the
+    constraint;
+  - the margin is a **preference, not a constraint**: more transformers shorten LV feeders but
+    lengthen the MV trunk and add another transformer impedance, so the achievable voltage
+    **plateaus**. When no count reaches the margin the search falls back to the **smallest feasible**
+    count and records why; if nothing is feasible it reports the least-violating partition.
+  - `k` never exceeds the customer count; diverged attempts step geometrically; the climb stops once
+    extra transformers stop buying voltage, but only once something feasible is in hand.
+  - `distance_cap` instead guarantees a cluster diameter by construction (no search, no power flow);
+    `capacity` is the legacy greedy packing and is the only criterion that reads
+    `max_lv_zone_radius_m` / `max_zone_customers`.
+- **Per zone:** transformer at the zone centroid (snapped to road), sized on the zone's apparent power
+  at `transformer_sizing_coincidence_factor` × 1.2; a **local LV tree** (Stage 3) → its own **sizing
+  loop**.
 - **MV trunk:** an MST `LVTopology` over `{source} ∪ {transformers}`, then an **MV-conductor upgrade
-  loop** (rank up the single MV conductor until the whole MV/LV power flow passes).
-- **Source model:** slack at `source_vm_pu = 1.04`; **no explicit step-up transformer** (MVP
-  simplification).
+  loop** (one conductor type for the whole trunk, ranked up until the full MV/LV power flow passes).
+- **Source model:** a **single slack on the plant LV bus** at `source_vm_pu` (default 1.0) and an
+  **explicit step-up transformer** feeding the MV backbone. (The flat-LV cases A/B get an ideal 0.4 kV
+  slack with no plant transformer — an asymmetry in their favour.)
 - **Infeasibility:** any zone/MV PF failing limits, or the MV loop running out of conductor ranks.
 
 ## Stage 7 — MV/LV SHS screen → Candidate D
@@ -161,12 +201,16 @@ them, cut them loose.
 so D gets its **own** solar set, not B's.
 
 - **Candidates:** `terminal_subtrees` of **each zone's** LV tree, id-namespaced (`Z03-S01`).
-- **Avoided cost (`_avoided_mvlv_subtree_cost`, deliberately conservative):** LV branch + drops + poles
-  + connection — **no loss term, and no per-branch transformer/MV credit**. The transformer/MV saving
-  is realized only implicitly: a zone that fully empties simply isn't rebuilt.
+- **Avoided cost (`_avoided_mvlv_subtree_cost`):** LV branch + drops + poles + connection + avoided
+  grid generation — but **no loss term and no per-branch transformer/MV credit**. The transformer/MV
+  saving is realized only implicitly: a zone that fully empties simply isn't rebuilt. Deliberately
+  conservative.
 - **Same greedy economic selection; same blocking rules.**
 - **Candidate D (`_run_mvlv_standalone`):** drop the selected SHS customers, **re-partition and rebuild
-  MV/LV** over the remainder. If none selected, D = C.
+  MV/LV** over the remainder — including a fresh zone-count search. If none selected, D = C.
+
+> Because D re-partitions from scratch, the branch/pole credits that drove its decisions refer to
+> Case C's geometry, which no longer exists in the realised candidate.
 
 ---
 
@@ -179,13 +223,17 @@ For **every** candidate:
   customer left off-grid is unacceptable).
 - `service_tier_violations = |all − (grid ∪ standalone)|` → reported (this is where Stage-3 unserved
   customers surface; the map colors them grey).
-- **Recommend:** `argmin total_npc` among **feasible** (NPC now includes mini-grid generation cost); if
-  none feasible, the least-infeasible by NPC (with its bottleneck reported).
-- **Also reported (not part of the decision):** a **coincident-peak stress** comparison (`coincident_*`
-  columns — how each candidate holds up with every user at peak at once); a **tier-served** table (grid
-  connections stay expandable, SHS are capped at their package's service tier — future-demand headroom);
-  and a **parallel-coordinates** plot of the **feasible** solutions across total NPC, total tier capacity
-  and coincident-peak min voltage (each normalized so up = better).
+- **Recommend:** `argmin total_npc` among **feasible**. If **none** is feasible, the fallback does
+  **not** use NPC — a diverged candidate has no computable loss cost, so its total is a lower bound
+  and it would win precisely *because* it is broken. Candidates are ranked instead by: power flow
+  converged → service obligations → `violation_severity` (distance from the limits) → cost
+  completeness → cost.
+- Candidates whose cost is incomplete carry `npc_complete = False` and
+  `npc_missing_components`, so an unknown component is never mistaken for a zero one.
+- **Also reported (not part of the decision):** a **coincident-peak stress** comparison
+  (`coincident_*` columns); a **tier-served** table (grid connections stay expandable, SHS are capped
+  at their package's service tier); and a **parallel-coordinates** plot of the **feasible** solutions
+  across total NPC, total tier capacity and coincident-peak min voltage.
 
 ---
 
@@ -194,18 +242,22 @@ For **every** candidate:
 | Step | Consumes | Produces / injects downstream |
 |---|---|---|
 | 1 Clean | raw files | clean tables + cost/eng params (used everywhere) |
-| 2 Project | clean customers | projected gdf + `crs_meta` |
+| 2 Project | clean customers | projected gdf + `crs_meta` + the run context |
 | 3 Engine | projected gdf, roads, eng knobs | `LVTopology` (served/unserved, drops, graph) |
 | 4 A | full topology, LV catalogue, constraints | sized model, horizon PF, `grid_customer_ids`, losses |
 | 5 B | A's tree + A's PF losses, packages, costs | SHS set → rebuilt LV |
-| 6 C | A's grid ids, zone/TX/MV catalogues | zones, transformers, MV trunk, PF |
-| 7 D | **C's** zone trees, packages, costs | zone-local SHS set → rebuilt MV/LV |
-| 8 Eval | all 4 cases + must/standalone flags | feasibility + recommendation + coincident-peak stress, tier-served & parallel-coordinates comparison |
+| 6 C | A's grid ids, zone/TX/MV catalogues | zones, transformers, MV trunk, PF, zone-count history |
+| 7 D | **C's** zone trees, packages, costs | zone-local SHS set → re-partitioned MV/LV |
+| 8 Eval | all 4 cases + must/standalone flags | feasibility + recommendation + stress, tier-served & trade-off comparison |
 
 ## Loops & infeasibility, summarized
 
 - **Iterative loops:** conductor sizing runs inside A, B, *every* C/D zone, and the MV trunk
-  (cheapest → upgrade critical lines → repeat).
+  (cheapest → upgrade critical lines → repeat); on top of that the `voltage_cap` **zone-count search**
+  rebuilds the entire MV/LV network once per attempted `k`, for both C and D.
 - **Infeasibility branches:** PF non-convergence; any voltage/loading limit breach; a `must_connect`
-  customer left off-grid; no remaining conductor rank; or no feasible SHS package (this last one blocks
-  *pruning*, not the candidate itself).
+  customer left off-grid; no remaining conductor rank; no zone count that holds the voltage; or no
+  feasible SHS package (this last one blocks *pruning*, not the candidate itself).
+- **Cost of the search.** Each `k` attempt is a full plan build + per-zone sizing + MV rank sweep, so a
+  240-customer settlement takes a few minutes end to end (measured ~240 s for Mafa without numba).
+  `max_transformers` bounds the worst case.
