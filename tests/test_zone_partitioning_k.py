@@ -251,3 +251,39 @@ def test_default_sizing_basis_is_the_declared_conservative_one():
     params = normalize_cost_parameters({})
     assert params["transformer_sizing_coincidence_factor"] == 1.0
     assert params["coincidence_factor"] == 0.6
+
+
+def test_k_search_respects_its_attempt_budget(inputs):
+    """The zone-count search must be bounded by EFFORT, not just by the k range.
+
+    Each attempt is a full plan build + per-zone sizing + MV rank sweep, and a pandapower
+    net build is O(n^2) in elements. When the voltage margin is unreachable AND nothing is
+    yet feasible for the plateau test to latch onto, bounding only k let the search walk the
+    whole range -- over 20 minutes on a 240-customer settlement.
+    """
+    from core.workflow.mvp_runner import run_simplified_mvp
+
+    customers = inputs["customers"].head(40).copy()
+    customers["must_connect_flag"] = False
+    params = dict(inputs["cost_parameters"])
+    params["max_transformers"] = 20
+    params["max_zone_count_attempts"] = 3
+    # An unreachable margin is what forces the search to spend its whole budget.
+    params["design_voltage_margin_pu"] = 0.09
+
+    res = run_simplified_mvp(
+        customers, inputs["roads"], inputs["source"], inputs["lv_conductors"],
+        inputs["mv_conductors"], inputs["transformers"], inputs["standalone_packages"],
+        params, {"max_user_connection_radius_m": 40, "max_users_per_pole": 12,
+                 "max_pole_span_m": 45, "road_pole_spacing_m": 35},
+    )
+
+    log = res.decision_log
+    rows = log[log["step"] == "mv_transformer_count"]
+    built = rows[~rows["decision"].isin(["search_stopped", "unbuildable"])]
+    # At most `max_zone_count_attempts` distinct zone counts were actually built, per case.
+    for cid in built["candidate_id"].unique():
+        n_built = built.loc[built["candidate_id"] == cid, "object_id"].nunique()
+        assert n_built <= 3, f"{cid} built {n_built} zone counts against a budget of 3"
+    # And the truncation is recorded rather than silent.
+    assert (rows["decision"] == "search_stopped").any()

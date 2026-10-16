@@ -199,6 +199,12 @@ COST_PARAMETER_DEFAULTS: Dict[str, float] = {
     "max_cluster_diameter_m": 500.0,
     "max_transformers": 12,
     "seed_diameter_m": 2000.0,
+    # Hard cap on how many zone counts the voltage_cap search may BUILD. Each attempt is a
+    # full plan build + per-zone sizing + MV rank sweep, and a pandapower net build is
+    # O(n^2) in elements, so an unbounded walk of the k range took >20 min on a
+    # 240-customer settlement when the voltage margin was unreachable. Bounding k alone is
+    # not enough; the fallback selection copes with finding nothing.
+    "max_zone_count_attempts": 8,
     # Planning reserve the voltage_cap k-search must keep ON TOP of voltage_min_pu when it
     # accepts a transformer count. Minimising k against the bare limit spends every volt of
     # headroom, leaving the chosen design sitting on the constraint, so any error in the

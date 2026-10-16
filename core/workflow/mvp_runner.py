@@ -513,6 +513,16 @@ def _voltage_cap_search(ctx, grid_ids, crs_epsg, max_kva, max_transformers, step
     # Never ask for more zones than there are customers to put in them.
     k_ceiling = max(1, min(int(max_transformers), len(grid_ids)))
 
+    # Hard bound on SEARCH EFFORT, not just on the k range. Each attempt is a full plan
+    # build, a per-zone sizing loop and an MV rank sweep, and building a pandapower net is
+    # O(n^2) in elements (every bus/line/load is an individual create_* call doing an O(n)
+    # pandas setitem). Bounding only k lets a case where the voltage margin is unreachable,
+    # and where nothing is yet feasible for the plateau test to latch onto, walk the whole
+    # range: measured at >20 minutes for a 240-customer settlement. The fallback selection
+    # already copes with finding nothing, so truncating costs at worst a larger zone count
+    # than the true optimum -- and the truncation is recorded in the search history.
+    max_attempts = max(1, int(params.get("max_zone_count_attempts", 8) or 8))
+
     v_min = float(params["voltage_min_pu"])
     margin = max(0.0, float(params.get("design_voltage_margin_pu", 0.0) or 0.0))
     v_target = v_min + margin
@@ -521,7 +531,14 @@ def _voltage_cap_search(ctx, grid_ids, crs_epsg, max_kva, max_transformers, step
     built_by_k: Dict[int, Dict[str, Any]] = {}
 
     def attempt(n_zones: int) -> Optional[Dict[str, Any]]:
-        """Build at ``n_zones``; None when that count cannot be partitioned or built."""
+        """Build at ``n_zones``; None when that count cannot be built or the budget is spent."""
+        if len(built_by_k) >= max_attempts:
+            iterations.append(_k_search_stop(
+                n_zones,
+                f"stopped searching: reached the {max_attempts}-attempt budget "
+                f"(max_zone_count_attempts)",
+            ))
+            return None
         try:
             groups = partition_zones(
                 "voltage_cap", grid_ids, ctx["gdf"], ctx["source"], crs_epsg,
@@ -1061,7 +1078,8 @@ def run_simplified_mvp(
               "coincidence_factor", "generation_lcoe_per_kwh",
               "clustering_criterion", "max_cluster_diameter_m", "max_transformers", "source_vm_pu",
               "design_voltage_margin_pu", "k_selection_snapshot",
-              "transformer_sizing_coincidence_factor", "standalone_sizing_tolerance"):
+              "transformer_sizing_coincidence_factor", "standalone_sizing_tolerance",
+              "max_zone_count_attempts"):
         if k in eng and eng[k] is not None:
             params[k] = eng[k]
     T = int(params["planning_horizon_years"])
