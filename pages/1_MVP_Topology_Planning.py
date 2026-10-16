@@ -225,6 +225,36 @@ with pf_col.container(border=True):
         help="Slack voltage on the plant LV bus; an explicit step-up transformer produces the MV drop "
              "(replaces the earlier fixed 1.04 pu slack placed directly on the MV bus).",
     )
+    design_voltage_margin_pu = st.number_input(
+        "Design voltage margin [pu]", 0.0, 0.08,
+        float(cp.get("design_voltage_margin_pu", 0.02)), 0.005, format="%.3f",
+        help="Planning reserve the zone-count search keeps ON TOP of the minimum voltage when it "
+             "accepts a transformer count. Minimising the count against the bare limit leaves the "
+             "design sitting on the constraint. It is a preference, not a constraint: if no zone "
+             "count can reach it (the voltage plateaus once the MV trunk, not the LV zones, is the "
+             "bottleneck) the search falls back to the smallest feasible count and says so. "
+             "0 reproduces the old behaviour. Does not change what counts as feasible.",
+    )
+    _snap_opts = ["design", "coincident"]
+    _snap_default = str(cp.get("k_selection_snapshot", "design"))
+    k_selection_snapshot = st.selectbox(
+        "Select zone count against", _snap_opts,
+        index=_snap_opts.index(_snap_default) if _snap_default in _snap_opts else 0,
+        help="Which snapshot the zone-count search must satisfy: 'design' (diversified, plus the "
+             "margin above) or 'coincident' (every customer at peak at once) -- the conservative "
+             "extreme, which needs many more transformers.",
+    )
+    transformer_sizing_coincidence_factor = st.number_input(
+        "Transformer sizing coincidence", 0.0, 1.0,
+        float(cp.get("transformer_sizing_coincidence_factor", 1.0)), 0.05, format="%.2f",
+        help="Diversity basis for transformer sizing and the zone kVA cap. 0 tracks the design "
+             "coincidence factor, so the rating and the loading it is checked against agree -- but "
+             "the design factor is a flat SYSTEM-WIDE number and diversity only emerges with many "
+             "customers, so it under-sizes small zones. The 1.0 default sizes on the coincident "
+             "zone peak: deliberately conservative (loading then peaks near 50%, so its limit never "
+             "binds) and it also buys LV voltage support, because a smaller unit has a higher "
+             "per-unit impedance. A size-dependent ADMD curve is the real answer.",
+    )
 
 eng = {
     # Topology heuristics
@@ -247,6 +277,9 @@ eng = {
     "max_cluster_diameter_m": max_cluster_diameter_m,
     "max_transformers": max_transformers,
     "source_vm_pu": source_vm_pu,
+    "design_voltage_margin_pu": design_voltage_margin_pu,
+    "k_selection_snapshot": k_selection_snapshot,
+    "transformer_sizing_coincidence_factor": transformer_sizing_coincidence_factor,
 }
 
 # --------------------------------------------------------------------------

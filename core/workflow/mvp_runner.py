@@ -28,6 +28,13 @@ from core.economics.standalone import cluster_standalone
 from .result_models import CaseResult, MVPResult
 
 
+# The single transformer sizing safety factor. It appears twice by design: once as the
+# target in ``select_transformer`` (1.2 * S_zone) and once as the divisor on the zone kVA
+# cap, so that a zone at the cap remains coverable by the largest catalogue unit. One
+# margin, two consistent uses -- not a compounded 1.44.
+TRANSFORMER_SIZING_SAFETY_FACTOR = 1.2
+
+
 def _log(log: List[Dict[str, Any]], step, candidate, obj, decision, reason, metric="", value="", threshold="") -> None:
     log.append(
         {
@@ -275,16 +282,42 @@ def _run_lv_standalone(ctx, full_res: CaseResult, sa_customers, sa_assignments, 
 # Case C — MV/LV service zones (criterion-driven transformer count)
 # ---------------------------------------------------------------------------
 
-def _iter_record(n_zones: int, outcome, note: str) -> Dict[str, Any]:
-    """One row of the transformer-count search history (for logs / UI)."""
+def _iter_record(n_zones: int, outcome, note: str, accepted: Optional[bool] = None,
+                 v_target: Optional[float] = None) -> Dict[str, Any]:
+    """One row of the transformer-count search history (for logs / UI).
+
+    ``feasible`` is the candidate's own feasibility test; ``accepted`` is the stricter
+    question the k-search asks (feasible AND holding the design voltage margin). They
+    differ whenever a partition only just scrapes past the limit.
+    """
     return {
         "n_zones": int(n_zones),
         "feasible": bool(outcome.feasible),
         "converged": bool(outcome.converged),
+        "accepted": (bool(outcome.feasible) if accepted is None else bool(accepted)),
         "min_vm_pu": float(outcome.min_vm_pu),
+        "v_target_pu": (float(v_target) if v_target is not None else float("nan")),
         "worst_dv_pu": (float(1.0 - outcome.min_vm_pu) if outcome.converged else float("nan")),
         "bottleneck": outcome.active_bottleneck,
         "note": note,
+    }
+
+
+def _k_search_failure(n_zones: int, note: str, error: str) -> Dict[str, Any]:
+    """History row for a zone count that could not even be partitioned/built."""
+    return {
+        "n_zones": int(n_zones), "feasible": False, "converged": False, "accepted": False,
+        "min_vm_pu": float("nan"), "v_target_pu": float("nan"), "worst_dv_pu": float("nan"),
+        "bottleneck": f"could not build {n_zones} zones: {error}", "note": note,
+    }
+
+
+def _k_search_stop(n_zones: int, reason: str) -> Dict[str, Any]:
+    """History row recording why the k-search stopped climbing (not a failed build)."""
+    return {
+        "n_zones": int(n_zones), "feasible": False, "converged": True, "accepted": False,
+        "min_vm_pu": float("nan"), "v_target_pu": float("nan"), "worst_dv_pu": float("nan"),
+        "bottleneck": reason, "note": "search_stopped",
     }
 
 
@@ -298,6 +331,7 @@ def _build_mvlv_at(ctx, groups: List[List[str]], stepup_spec: Dict[str, Any]) ->
     plan = build_mvlv_plan(
         groups, ctx["gdf"], ctx["roads"], ctx["crs_meta"], ctx["source"], ctx["eng"],
         ctx["customers"], ctx["transformers"], horizon_years=T,
+        coincidence_factor=ctx["tx_coincidence"],
     )
     zone_cond: Dict[str, Any] = {}
     transformers_chosen: List[Dict[str, Any]] = []
@@ -331,55 +365,197 @@ def _build_mvlv_at(ctx, groups: List[List[str]], stepup_spec: Dict[str, Any]) ->
 
 
 def _voltage_cap_search(ctx, grid_ids, crs_epsg, max_kva, max_transformers, stepup_spec, seed):
-    """Iterate the number of zones and let the power flow pick the MINIMUM that holds the cap.
+    """Search the number of zones for the smallest count that holds the LV voltage target.
 
-    ``run_powerflow`` feasibility already encodes the LV voltage cap (v_min >= voltage_min_pu,
-    i.e. dV <= 1 - voltage_min_pu) plus line/transformer loading, and treats Newton-Raphson
-    divergence as infeasible. Seed at a physically-motivated zone count, then backtrack to the
-    minimum feasible count (or climb to max_transformers if the seed is not enough).
+    Three properties, each fixing a specific defect in the previous search:
+
+    * **The partition family is nested.** ``partition_zones`` cuts one Ward dendrogram at k
+      (:func:`~core.topology.mvlv_service_zones.partition_hierarchical_k`), so k+1 refines
+      k instead of reshuffling it. With the old k-means-per-k the worst voltage drop was not
+      even monotone in k (measured on Mafa: k=4 worse than k=3), which is incompatible with
+      a search that stops at the first failure.
+
+    * **Acceptance keeps a declared margin.** A partition is *accepted* only at
+      ``min_vm_pu >= voltage_min_pu + design_voltage_margin_pu``. Minimising k against the
+      bare limit spends every last volt of headroom, leaving the chosen design sitting on
+      the constraint (0.913 pu against a 0.90 limit, measured), so any error in the
+      diversity assumption or the load estimate flips it infeasible.
+
+      The margin is a **preference, not a constraint**: adding transformers shortens LV
+      feeders but lengthens the MV trunk and adds another transformer impedance, so the
+      achievable voltage *plateaus* -- on Mafa it saturates near 0.905 pu and no zone count
+      reaches a 0.92 target. When the margin is unreachable the search falls back to the
+      smallest merely-feasible count and says so, rather than climbing to the ceiling and
+      returning the most expensive (and possibly infeasible) partition.
+
+    * **The climb is bounded by geometry and by progress.** k never exceeds the customer
+      count (the old loop was bounded only by ``max_transformers`` and raised out of the
+      partitioner for a settlement smaller than that cap), and the climb stops once extra
+      transformers stop buying voltage.
+
+    Candidate feasibility itself is unchanged -- the margin governs which k the *designer*
+    picks, not what counts as a feasible network.
     """
     T = ctx["T"]
+    params = ctx["params"]
     coords, _ = _coords_and_ids(grid_ids, ctx["gdf"])
     iterations: List[Dict[str, Any]] = []
 
-    def attempt(n_zones: int) -> Dict[str, Any]:
-        groups = partition_zones(
-            "voltage_cap", grid_ids, ctx["gdf"], ctx["source"], crs_epsg,
-            customers_df=ctx["customers"], horizon_years=T, max_zone_kva=max_kva,
-            max_zone_radius_m=float(ctx["params"]["max_lv_zone_radius_m"]),
-            max_zone_customers=int(ctx["params"]["max_zone_customers"]),
-            n_zones=int(n_zones), seed=seed,
+    # Never ask for more zones than there are customers to put in them.
+    k_ceiling = max(1, min(int(max_transformers), len(grid_ids)))
+
+    v_min = float(params["voltage_min_pu"])
+    margin = max(0.0, float(params.get("design_voltage_margin_pu", 0.0) or 0.0))
+    v_target = v_min + margin
+    on_coincident = str(params.get("k_selection_snapshot", "design")) == "coincident"
+
+    built_by_k: Dict[int, Dict[str, Any]] = {}
+
+    def attempt(n_zones: int) -> Optional[Dict[str, Any]]:
+        """Build at ``n_zones``; None when that count cannot be partitioned or built."""
+        try:
+            groups = partition_zones(
+                "voltage_cap", grid_ids, ctx["gdf"], ctx["source"], crs_epsg,
+                customers_df=ctx["customers"], horizon_years=T, max_zone_kva=max_kva,
+                max_zone_radius_m=float(params["max_lv_zone_radius_m"]),
+                max_zone_customers=int(params["max_zone_customers"]),
+                n_zones=int(n_zones), seed=seed,
+                coincidence_factor=ctx["tx_coincidence"],
+            )
+            built = _build_mvlv_at(ctx, groups, stepup_spec)
+        except ValueError as exc:
+            # Too few distinct locations for this many zones, or a degenerate geometry.
+            iterations.append(_k_search_failure(n_zones, "unbuildable", str(exc)))
+            return None
+        built_by_k.setdefault(len(built["plan"].zones), built)
+        return built
+
+    def selection_outcome(built):
+        return built["stress_outcome"] if on_coincident else built["outcome"]
+
+    def is_feasible(built) -> bool:
+        """Feasible in the candidate's own terms (design snapshot within every limit)."""
+        o = built["outcome"]
+        return o is not None and o.feasible
+
+    def accepts(built) -> bool:
+        """Feasible AND clear of the voltage target on the selection snapshot."""
+        if not is_feasible(built):
+            return False
+        o = selection_outcome(built)
+        if o is None or not o.converged:
+            return False
+        return float(o.min_vm_pu) >= v_target
+
+    def record(built, note):
+        iterations.append(_iter_record(
+            len(built["plan"].zones), built["outcome"], note,
+            accepted=accepts(built), v_target=v_target,
+        ))
+
+    # Seed from geometry only. Warm-starting Case D from Case C's accepted count is
+    # tempting (it cut ~25% off the runtime) but wrong: the seed is only ever climbed FROM,
+    # so seeding D at C's k=10 meant D never tried a smaller count, and a case that is
+    # feasible at k=5 was reported infeasible. Cost is not worth a missed solution.
+    k_seed = max(1, min(int(suggest_zone_start(coords, float(params["seed_diameter_m"]))), k_ceiling))
+    seeded = attempt(k_seed)
+    if seeded is None:
+        raise ValueError(
+            f"Could not build an MV/LV partition at any zone count up to {k_ceiling} for "
+            f"{len(grid_ids)} customers (seed k={k_seed}). Check for duplicate customer "
+            f"coordinates or relax 'max_transformers'."
         )
-        return _build_mvlv_at(ctx, groups, stepup_spec)
+    record(seeded, "seed")
 
-    k_seed = max(1, min(int(suggest_zone_start(coords, float(ctx["params"]["seed_diameter_m"]))), max_transformers))
-    best = attempt(k_seed)
-    iterations.append(_iter_record(len(best["plan"].zones), best["outcome"], "seed"))
-
-    if best["outcome"].feasible:
-        # Backtrack toward fewer zones; accept only strictly smaller feasible partitions.
-        target = len(best["plan"].zones) - 1
+    if accepts(seeded):
+        # Backtrack toward fewer zones while the target still holds.
+        target = len(seeded["plan"].zones) - 1
         while target >= 1:
             cand = attempt(target)
-            n = len(cand["plan"].zones)
-            iterations.append(_iter_record(n, cand["outcome"], "backtrack"))
-            if cand["outcome"].feasible and n < len(best["plan"].zones):
-                best = cand
-                target = n - 1
-            else:
+            if cand is None:
                 break
+            record(cand, "backtrack")
+            if not accepts(cand):
+                break
+            target = len(cand["plan"].zones) - 1
     else:
-        # Climb toward more zones until feasible or the safety cap is hit.
-        target = len(best["plan"].zones) + 1
-        while target <= max_transformers:
+        # Climb toward more zones until the target is met, the ceiling is hit, or -- once a
+        # feasible partition is already in hand -- extra transformers stop buying voltage.
+        #
+        # The plateau test is gated on having something feasible for a measured reason: on
+        # the Mafa case the worst voltage sits flat at 0.884 pu for k=4..7 and then JUMPS to
+        # 0.905 at k=10, when a split finally relieves the one binding feeder. Flat is not
+        # the same as saturated, so stopping on flatness alone would discard the only
+        # feasible designs. The plateau break is a cost optimisation and must never cost
+        # feasibility.
+        vm_since_feasible: List[float] = []
+        target = len(seeded["plan"].zones) + 1
+        while target <= k_ceiling:
             cand = attempt(target)
-            n = len(cand["plan"].zones)
-            iterations.append(_iter_record(n, cand["outcome"], "climb"))
-            best = cand
-            if cand["outcome"].feasible:
+            if cand is None:
                 break
-            target = n + 1
+            n = len(cand["plan"].zones)
+            record(cand, "climb")
+            if accepts(cand):
+                break
+            o = cand["outcome"]
+            if any(is_feasible(b) for b in built_by_k.values()):
+                vm_since_feasible.append(
+                    float(o.min_vm_pu) if (o is not None and o.converged) else float("nan")
+                )
+                if _voltage_has_plateaued(vm_since_feasible):
+                    iterations.append(_k_search_stop(
+                        n,
+                        "stopped climbing: extra transformers no longer improve the worst "
+                        "voltage (bottleneck is the MV trunk / step-up, not the LV zones)",
+                    ))
+                    break
+            if o is None or not o.converged:
+                # Divergence means grossly too few zones, not "one short": stepping by one
+                # pays for a full build per step through a prefix that cannot converge
+                # (k=1,2,3 on Mafa). Double instead, then refine by one once it solves.
+                target = min(k_ceiling, max(n + 1, n * 2))
+            else:
+                target = max(n + 1, target + 1)  # guard: a cap-split can stall the climb
+
+    # Selection: smallest accepted count; else smallest merely-feasible count; else the
+    # attempt that came closest to being usable (for the infeasible-candidate report).
+    accepted_ks = sorted(k for k, b in built_by_k.items() if accepts(b))
+    feasible_ks = sorted(k for k, b in built_by_k.items() if is_feasible(b))
+    if accepted_ks:
+        chosen_k = accepted_ks[0]
+        note = f"smallest zone count holding v_min >= {v_target:.3f} pu"
+    elif feasible_ks:
+        chosen_k = feasible_ks[0]
+        note = (
+            f"design voltage margin of {margin:.3f} pu unreachable at any zone count "
+            f"(best {max((float(selection_outcome(b).min_vm_pu)) for b in built_by_k.values() if selection_outcome(b).converged):.3f} pu); "
+            f"fell back to the smallest feasible count"
+        )
+    else:
+        chosen_k = min(
+            built_by_k,
+            key=lambda k: violation_severity(built_by_k[k]["outcome"], ctx["constraints"]),
+        )
+        note = "no zone count is feasible; reporting the least-violating partition"
+    best = built_by_k[chosen_k]
+    best["selection_note"] = note
     return best, iterations
+
+
+def _voltage_has_plateaued(vm_seen: List[float], *, patience: int = 3, eps: float = 2e-3) -> bool:
+    """True when the last ``patience`` zone counts stopped improving the worst voltage.
+
+    Adding a transformer shortens the LV feeders inside the zone it splits but lengthens
+    the MV trunk and inserts another transformer impedance, so the achievable minimum
+    voltage saturates. Past that point the climb is buying nothing and paying for a
+    transformer, an MV spur and its losses each step, so it stops.
+    """
+    finite = [v for v in vm_seen if v == v]  # drop NaN (non-converged attempts)
+    if len(finite) <= patience:
+        return False
+    best_before = max(finite[:-patience])
+    return max(finite[-patience:]) <= best_before + eps
 
 
 def _build_mvlv(ctx, grid_ids: List[str]) -> Dict[str, Any]:
@@ -393,14 +569,19 @@ def _build_mvlv(ctx, grid_ids: List[str]) -> Dict[str, Any]:
     # Cap zone load at the largest transformer's derated rating over the sizing safety factor,
     # so even the biggest zone leaves headroom (avoids transformer overload at horizon).
     max_derated = float((ctx["transformers"]["sn_kva"] * ctx["transformers"]["max_loading_percent"] / 100.0).max())
-    max_kva = max_derated / 1.2
+    # Divide by the sizing safety factor so a zone sitting exactly on the cap is still
+    # coverable by the largest catalogue transformer (select_transformer targets 1.2*S).
+    # This is the SAME margin, applied once -- not a second, compounding one.
+    max_kva = max_derated / TRANSFORMER_SIZING_SAFETY_FACTOR
     criterion = str(ctx["params"].get("clustering_criterion", "voltage_cap"))
     max_transformers = int(ctx["params"].get("max_transformers", 12))
     seed = 42
 
     # Plant step-up sized on the whole settlement's coincident apparent power (may exceed the
     # catalogue; it is a single project-procured unit, unlike the kVA-capped zone step-downs).
-    s_system_kva = zone_apparent_power_kva(list(grid_ids), ctx["customers"], T)
+    s_system_kva = zone_apparent_power_kva(
+        list(grid_ids), ctx["customers"], T, ctx["tx_coincidence"]
+    )
     stepup_spec = build_stepup_spec(s_system_kva, ctx["transformers"], mv_kv=ctx["mv_kv"], lv_kv=ctx["lv_kv"])
 
     if criterion == "voltage_cap":
@@ -412,7 +593,7 @@ def _build_mvlv(ctx, grid_ids: List[str]) -> Dict[str, Any]:
             max_zone_radius_m=float(ctx["params"]["max_lv_zone_radius_m"]),
             max_zone_customers=int(ctx["params"]["max_zone_customers"]),
             max_cluster_diameter_m=float(ctx["params"]["max_cluster_diameter_m"]),
-            seed=seed,
+            seed=seed, coincidence_factor=ctx["tx_coincidence"],
         )
         if criterion == "distance_cap" and len(groups) > max_transformers:
             raise ValueError(
@@ -426,6 +607,7 @@ def _build_mvlv(ctx, grid_ids: List[str]) -> Dict[str, Any]:
     plan = best["plan"]
     plan.clustering_criterion = criterion
     plan.mv_iterations = iterations
+    plan.selection_note = best.get("selection_note", "")
 
     # Coincident-peak stress: same network + chosen MV conductor, every customer at horizon peak
     # simultaneously (factor 1.0). Reported alongside the design outcome, not used to gate feasibility.
@@ -468,11 +650,24 @@ def _run_mvlv(ctx, grid_ids: List[str], *, cid: str = "C_MVLV", architecture: st
     stepup = built["stepup"]
     criterion = plan.clustering_criterion or "voltage_cap"
     _log(ctx["log"], "mvlv_zone", cid, "partition", f"{criterion} → {len(plan.zones)} transformer zones",
+         getattr(plan, "selection_note", "") or f"{criterion} partition",
          "n_zones", f"{len(plan.zones)} over {len(grid_ids)} customers")
     for it in built["iterations"]:
-        _log(ctx["log"], "mv_transformer_count", cid, f"k={it['n_zones']}",
-             "feasible" if it["feasible"] else ("diverged" if not it["converged"] else "infeasible"),
-             it["bottleneck"], "worst_dv_pu", f"{it['worst_dv_pu']:.4f}", threshold=it["note"])
+        if it["note"] in ("search_stopped", "unbuildable"):
+            verdict = it["note"]
+        elif not it["converged"]:
+            verdict = "diverged"
+        elif it["accepted"]:
+            verdict = "accepted"
+        elif it["feasible"]:
+            # Within the limits but not clear of the design voltage margin: a partition
+            # sitting on the constraint is not what the search should settle for.
+            verdict = "feasible_no_margin"
+        else:
+            verdict = "infeasible"
+        _log(ctx["log"], "mv_transformer_count", cid, f"k={it['n_zones']}", verdict,
+             it["bottleneck"], "min_vm_pu",
+             f"{it['min_vm_pu']:.4f} (target {it['v_target_pu']:.4f})", threshold=it["note"])
     _log(ctx["log"], "transformer_sizing", cid, "stepup", f"plant step-up {stepup['sn_kva']:.0f} kVA",
          "system coincident S × margin, may exceed catalogue", "sn_kva", f"{stepup['sn_kva']}")
     for tx in transformers_chosen:
@@ -753,7 +948,9 @@ def run_simplified_mvp(
     for k in ("planning_horizon_years", "discount_rate", "voltage_min_pu", "voltage_max_pu",
               "max_line_loading_percent", "max_transformer_loading_percent",
               "coincidence_factor", "generation_lcoe_per_kwh",
-              "clustering_criterion", "max_cluster_diameter_m", "max_transformers", "source_vm_pu"):
+              "clustering_criterion", "max_cluster_diameter_m", "max_transformers", "source_vm_pu",
+              "design_voltage_margin_pu", "k_selection_snapshot",
+              "transformer_sizing_coincidence_factor"):
         if k in eng and eng[k] is not None:
             params[k] = eng[k]
     T = int(params["planning_horizon_years"])
@@ -777,6 +974,13 @@ def run_simplified_mvp(
         "mv_conductors": mv_conductors, "transformers": transformers, "packages": standalone_packages,
         "lv_kv": float(source.get("lv_voltage_kv", 0.4)), "mv_kv": float(source.get("mv_voltage_kv", 11.0)),
         "coincidence": float(params["coincidence_factor"]), "annual_kwh_by_id": annual_kwh_by_id,
+        # Diversity basis for transformer sizing / the zone kVA cap. Defaults to the design
+        # coincidence factor so the rating and the loading it is validated against agree.
+        "tx_coincidence": (
+            float(params["transformer_sizing_coincidence_factor"])
+            if float(params.get("transformer_sizing_coincidence_factor", 0.0) or 0.0) > 0.0
+            else float(params["coincidence_factor"])
+        ),
         "source_vm_pu": float(params["source_vm_pu"]),
         "log": log,
     }

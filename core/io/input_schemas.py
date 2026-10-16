@@ -199,14 +199,48 @@ COST_PARAMETER_DEFAULTS: Dict[str, float] = {
     "max_cluster_diameter_m": 500.0,
     "max_transformers": 12,
     "seed_diameter_m": 2000.0,
+    # Planning reserve the voltage_cap k-search must keep ON TOP of voltage_min_pu when it
+    # accepts a transformer count. Minimising k against the bare limit spends every volt of
+    # headroom, leaving the chosen design sitting on the constraint, so any error in the
+    # diversity assumption or load estimate flips it infeasible. 0.0 reproduces the old
+    # behaviour. It does NOT change what counts as a feasible candidate.
+    "design_voltage_margin_pu": 0.02,
+    # Which snapshot the k-search selects against: "design" (diversified, + the margin
+    # above) or "coincident" (every customer at peak at once -- the conservative extreme).
+    "k_selection_snapshot": "design",
+    # Diversity basis for transformer sizing and the zone kVA cap. 0 => track
+    # coincidence_factor (the design power flow's basis); any value in (0, 1] is used
+    # directly. Default 1.0 = size on the coincident zone peak.
+    #
+    # This is a DELIBERATE, declared conservatism, not an oversight -- it used to be a
+    # hard-coded 1.0 with no stated rationale, which is what made it look like a bug:
+    # sizing at 1.0 while validating at 0.6 makes the rating 1/0.6 larger than the
+    # snapshot it is checked against (2.0x with the 1.2 margin), so transformer loading
+    # peaks near 50% and max_transformer_loading_percent can never bind.
+    #
+    # Setting it to 0 (track the design factor) is nevertheless NOT the right default:
+    # coincidence_factor here is a single flat SYSTEM-WIDE number, and diversity only
+    # emerges with many aggregated customers. Applied to a 10-customer zone it understates
+    # that zone's real peak, so it would under-size exactly the small zones. Measured on
+    # the Mafa case: tracking the design factor shrinks the units, raises their per-unit
+    # impedance and costs ~0.010 pu of LV voltage, which pushed Case D from feasible
+    # (8 zones, 0.916 pu) to infeasible (10 zones, 0.8998 pu) -- so the oversizing was
+    # partly buying voltage support, not purely wasted money.
+    #
+    # The principled fix is a size-dependent ADMD / diversity curve (cf as a function of
+    # the number of aggregated customers) rather than either flat number; until then this
+    # stays explicit, single-sourced and reported, with the loading headroom visible so the
+    # slack is auditable instead of hidden.
+    "transformer_sizing_coincidence_factor": 1.0,
     # Sending voltage at the plant LV slack; an explicit step-up transformer produces the real
     # drop onto the MV backbone (replaces the earlier fixed 1.04 pu slack on the MV bus).
     "source_vm_pu": 1.0,
 }
 
 # Non-numeric parameters passed through verbatim by ``normalize_cost_parameters``.
-_STRING_PARAMETERS = frozenset({"clustering_criterion"})
+_STRING_PARAMETERS = frozenset({"clustering_criterion", "k_selection_snapshot"})
 _ALLOWED_CLUSTERING_CRITERIA = frozenset({"voltage_cap", "distance_cap", "capacity"})
+_ALLOWED_K_SNAPSHOTS = frozenset({"design", "coincident"})
 
 
 # Parameters that were removed from the engine but may still appear in older input files.
@@ -275,5 +309,10 @@ def normalize_cost_parameters(params: Dict[str, Any], *, strict: bool = False) -
     if crit not in _ALLOWED_CLUSTERING_CRITERIA:
         raise ValueError(
             f"clustering_criterion must be one of {sorted(_ALLOWED_CLUSTERING_CRITERIA)}; got {crit!r}"
+        )
+    snap = str(out.get("k_selection_snapshot", "design"))
+    if snap not in _ALLOWED_K_SNAPSHOTS:
+        raise ValueError(
+            f"k_selection_snapshot must be one of {sorted(_ALLOWED_K_SNAPSHOTS)}; got {snap!r}"
         )
     return out

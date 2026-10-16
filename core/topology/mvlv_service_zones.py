@@ -42,6 +42,8 @@ class MVLVPlan:
     mv_topology: Optional[LVTopology] = None
     clustering_criterion: str = ""
     mv_iterations: List[Dict[str, Any]] = field(default_factory=list)
+    # Why this zone count was chosen (margin held / margin unreachable / nothing feasible).
+    selection_note: str = ""
 
 
 def _customer_kva(customers_df: pd.DataFrame, horizon_years: int) -> Dict[str, float]:
@@ -52,11 +54,26 @@ def _customer_kva(customers_df: pd.DataFrame, horizon_years: int) -> Dict[str, f
     return {str(k): float(v) for k, v in s.items()}
 
 
-def zone_apparent_power_kva(customer_ids: List[str], customers_df: pd.DataFrame, horizon_years: int) -> float:
-    # Coincident apparent power is the vector sum of P and Q, not the sum of |S|.
+def zone_apparent_power_kva(
+    customer_ids: List[str],
+    customers_df: pd.DataFrame,
+    horizon_years: int,
+    coincidence_factor: float = 1.0,
+) -> float:
+    """Horizon apparent power of a customer group [kVA], diversified by ``coincidence_factor``.
+
+    Apparent power is the vector sum of P and Q, not the sum of |S|.
+
+    ``coincidence_factor`` must be the SAME diversity assumption the network is validated
+    against. Sizing at 1.0 while the design power flow runs at ``cf`` makes the transformer
+    ``1/cf`` times larger than the snapshot it is checked against (2.0x at the 0.6 default,
+    on top of the 1.2 sizing margin), so transformer loading could never approach its limit
+    and the constraint never bound. See ``transformer_sizing_coincidence_factor``.
+    """
     by = customers_df.set_index("customer_id")
     rows = by.loc[[c for c in customer_ids if c in by.index]]
-    p = (rows["peak_kw_now"] * (1.0 + rows["growth_rate"]) ** horizon_years)
+    cf = float(coincidence_factor)
+    p = (rows["peak_kw_now"] * (1.0 + rows["growth_rate"]) ** horizon_years) * cf
     q = p * (((1.0 / rows["power_factor"].clip(0.5, 1.0)) ** 2 - 1.0) ** 0.5)
     return math.sqrt(float(p.sum()) ** 2 + float(q.sum()) ** 2)
 
@@ -206,6 +223,35 @@ def partition_kmeans(coords_m: np.ndarray, n_clusters: int, seed: int = 42, retr
     )
 
 
+def partition_hierarchical_k(coords_m: np.ndarray, n_clusters: int) -> np.ndarray:
+    """Ward-linkage dendrogram cut at exactly ``n_clusters`` -- a NESTED family over k.
+
+    This is what the voltage-cap k-search iterates over, and the nesting is the whole
+    point. k-means re-partitions from scratch at every k, so the zones at k+1 bear no
+    relation to those at k: adding a transformer can move customers between unrelated
+    clusters and make the worst LV voltage drop *worse*. That was measured on the Mafa
+    case (k=4 gave a 0.1028 pu drop against k=3's 0.1004 pu), which breaks the
+    monotonicity the "backtrack to the minimum feasible k" search assumes.
+
+    Cutting one Ward dendrogram instead means the k+1 partition strictly refines the k
+    partition: a zone is split, never reshuffled, so each added transformer can only
+    shorten the LV paths inside the zone it splits. Feasibility is then well behaved in k
+    (still not formally guaranteed -- transformer placement and the per-zone MST are
+    recomputed -- but no longer actively fighting the search).
+
+    Deterministic: no seed, no restarts.
+    """
+    coords = np.asarray(coords_m, dtype=float)
+    n = coords.shape[0]
+    if n_clusters <= 1 or n <= 1:
+        return np.zeros(n, dtype=int)
+    if n_clusters > n:
+        raise ValueError(f"{n_clusters} clusters requested but only {n} customers")
+    Z = linkage(coords, method="ward")
+    labels = fcluster(Z, t=int(n_clusters), criterion="maxclust") - 1
+    return labels.astype(int)
+
+
 def suggest_zone_start(coords_m: np.ndarray, hopeless_diameter_m: float = 2000.0) -> int:
     """Physically-motivated starting number of zones for the voltage-cap loop.
 
@@ -229,6 +275,7 @@ def _split_over_cap(
     horizon_years: int,
     max_zone_kva: float,
     seed: int,
+    coincidence_factor: float = 1.0,
 ) -> List[List[str]]:
     """Recursively bisect a group until every child is within the kVA cap.
 
@@ -236,7 +283,9 @@ def _split_over_cap(
     singleton (unavoidable: no procurable transformer covers it) — the caller's
     post-condition allows singletons over cap.
     """
-    if len(group) <= 1 or zone_apparent_power_kva(group, customers_df, horizon_years) <= max_zone_kva:
+    if len(group) <= 1 or zone_apparent_power_kva(
+        group, customers_df, horizon_years, coincidence_factor
+    ) <= max_zone_kva:
         return [sorted(group)]
     coords, ids = _coords_and_ids(group, customers_engine_gdf)
     try:
@@ -248,7 +297,10 @@ def _split_over_cap(
         return [[i] for i in ids]
     out: List[List[str]] = []
     for child in children:
-        out.extend(_split_over_cap(child, customers_engine_gdf, customers_df, horizon_years, max_zone_kva, seed))
+        out.extend(_split_over_cap(
+            child, customers_engine_gdf, customers_df, horizon_years, max_zone_kva, seed,
+            coincidence_factor,
+        ))
     return out
 
 
@@ -259,6 +311,7 @@ def enforce_kva_cap(
     horizon_years: int,
     max_zone_kva: float,
     seed: int = 42,
+    coincidence_factor: float = 1.0,
 ) -> List[List[str]]:
     """Split any zone exceeding the largest procurable transformer rating.
 
@@ -270,7 +323,10 @@ def enforce_kva_cap(
     for g in groups:
         if not g:
             continue
-        out.extend(_split_over_cap(g, customers_engine_gdf, customers_df, horizon_years, max_zone_kva, seed))
+        out.extend(_split_over_cap(
+            g, customers_engine_gdf, customers_df, horizon_years, max_zone_kva, seed,
+            coincidence_factor,
+        ))
     return out
 
 
@@ -289,15 +345,20 @@ def partition_zones(
     max_cluster_diameter_m: float = 500.0,
     n_zones: Optional[int] = None,
     seed: int = 42,
+    coincidence_factor: float = 1.0,
 ) -> List[List[str]]:
     """Dispatch to the requested partitioning criterion; all enforce the kVA cap.
 
-    - ``capacity``: greedy farthest-first packing (legacy default), already
-      kVA-capped internally.
-    - ``distance_cap``: complete-linkage cut at ``max_cluster_diameter_m`` then
-      kVA split. Deterministic, one-shot, no power flow.
-    - ``voltage_cap``: k-means into ``n_zones`` clusters then kVA split; the
-      workflow runner iterates ``n_zones`` and validates each with a power flow.
+    - ``capacity``: greedy farthest-first packing (legacy), already kVA-capped internally.
+    - ``distance_cap``: complete-linkage cut at ``max_cluster_diameter_m`` then kVA split.
+      Deterministic, one-shot, no power flow.
+    - ``voltage_cap``: Ward dendrogram cut at ``n_zones`` then kVA split; the workflow
+      runner iterates ``n_zones`` and validates each with a power flow. The cut is nested
+      over k (see :func:`partition_hierarchical_k`) so the search is not fighting a
+      partition that reshuffles itself at every step.
+
+    ``coincidence_factor`` is the diversity basis for the kVA cap and must match the one
+    the network is validated against.
     """
     if criterion == "capacity":
         return partition_service_zones(
@@ -317,12 +378,15 @@ def partition_zones(
         if int(n_zones) <= 1 or coords.shape[0] <= 1:
             groups = [sorted(ids)]
         else:
-            labels = partition_kmeans(coords, int(n_zones), seed=seed)
+            labels = partition_hierarchical_k(coords, int(n_zones))
             groups = _labels_to_groups(ids, labels)
     else:
         raise ValueError(f"Unknown clustering_criterion: {criterion!r}")
 
-    return enforce_kva_cap(groups, customers_engine_gdf, customers_df, horizon_years, max_zone_kva, seed=seed)
+    return enforce_kva_cap(
+        groups, customers_engine_gdf, customers_df, horizon_years, max_zone_kva,
+        seed=seed, coincidence_factor=coincidence_factor,
+    )
 
 
 def size_stepup_kva(s_system_kva: float, sizing_margin: float, transformers_df: pd.DataFrame) -> float:
@@ -449,8 +513,14 @@ def build_mvlv_plan(
     transformers_df: pd.DataFrame,
     *,
     horizon_years: int,
+    coincidence_factor: float = 1.0,
 ) -> MVLVPlan:
-    """One transformer service zone per customer group; MV trunk = MST over the transformers."""
+    """One transformer service zone per customer group; MV trunk = MST over the transformers.
+
+    ``coincidence_factor`` is the diversity basis for transformer sizing; pass the same
+    value the design power flow uses so the chosen rating and the loading it is checked
+    against refer to the same demand.
+    """
     crs_epsg = int(crs_meta.get("projected_crs_epsg") or 32633)
     by_ll = customers_df.set_index("customer_id")[["latitude", "longitude"]]
 
@@ -474,7 +544,7 @@ def build_mvlv_plan(
             customers_engine_gdf, zroads, crs_meta,
             {"latitude": tx_latlon[0], "longitude": tx_latlon[1]}, eng, customer_ids=group,
         )
-        s_kva = zone_apparent_power_kva(group, customers_df, horizon_years)
+        s_kva = zone_apparent_power_kva(group, customers_df, horizon_years, coincidence_factor)
         tx = select_transformer(s_kva, transformers_df)
         zones.append({
             "zone_id": zid, "cluster_id": zid, "transformer_id": f"{zid}_{tx['transformer_id']}",
