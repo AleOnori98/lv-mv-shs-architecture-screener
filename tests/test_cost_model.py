@@ -1,6 +1,8 @@
 """Cost model + NPC aggregation."""
 from __future__ import annotations
 
+import math
+
 from types import SimpleNamespace
 
 import pandas as pd
@@ -46,7 +48,9 @@ def test_line_cost_uses_length_and_civil_multiplier():
 def test_loss_present_value_non_negative():
     params = {"loss_load_factor": 0.3, "loss_value_per_kwh": 0.2, "discount_rate": 0.08, "planning_horizon_years": 15}
     assert cm.loss_present_value(5.0, params) > 0
-    assert cm.loss_present_value(float("nan"), params) == 0.0
+    # Unknown losses (diverged power flow) are NaN, NOT zero: charging nothing for the
+    # losses of an unsolvable network made diverged candidates the cheapest ones.
+    assert math.isnan(cm.loss_present_value(float("nan"), params))
 
 
 def test_avoided_lv_cost_includes_service_drops_and_losses():

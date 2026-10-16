@@ -1,6 +1,8 @@
 """Small table-presentation helpers for the Streamlit dashboard."""
 from __future__ import annotations
 
+import math
+
 from typing import Any, Dict
 
 import pandas as pd
@@ -102,12 +104,22 @@ NPC_COMPONENTS = {
 
 
 def npc_components(cost_breakdown_table: pd.DataFrame, candidate_id: str) -> pd.DataFrame:
-    """Non-zero NPC components for one candidate: columns ``component, npc, share_%`` (desc)."""
+    """Non-zero NPC components for one candidate: columns ``component, npc, share_%`` (desc).
+
+    Components that are **unknown** (NaN -- e.g. the loss cost of a candidate whose power
+    flow diverged) are left out rather than plotted as a NaN bar or folded into the share
+    denominator. The candidate's ``npc_complete`` / ``npc_missing_components`` fields in the
+    comparison table are what report the omission.
+    """
     row = cost_breakdown_table[cost_breakdown_table["candidate_id"] == candidate_id]
     if row.empty:
         return pd.DataFrame(columns=["component", "npc", "share_%"])
     row = row.iloc[0]
-    items = [(NPC_COMPONENTS[c], float(row[c])) for c in NPC_COMPONENTS if c in row.index and float(row[c]) != 0.0]
+    items = [
+        (NPC_COMPONENTS[c], float(row[c]))
+        for c in NPC_COMPONENTS
+        if c in row.index and not math.isnan(float(row[c])) and float(row[c]) != 0.0
+    ]
     df = pd.DataFrame(items, columns=["component", "npc"]).sort_values("npc", ascending=False)
     total = float(df["npc"].sum())
     df["share_%"] = (df["npc"] / total * 100.0).round(1) if total else 0.0

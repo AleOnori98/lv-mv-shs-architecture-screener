@@ -1,6 +1,7 @@
 """Run pandapower power flow and summarize feasibility against MVP constraints."""
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
 from typing import Any, Dict, List
 
@@ -24,6 +25,22 @@ class PFOutcome:
     error: str = ""
 
 
+def _not_converged(total_load_kw: float, error: str = "") -> PFOutcome:
+    """Outcome for a power flow that did not solve.
+
+    Every numeric result is NaN: nothing about the network state is known, so no limit
+    check may be evaluated (a NaN comparison is always False and would otherwise read as
+    "within limits"). ``losses_kw`` stays NaN so the cost model can report the loss
+    component as *unknown* rather than silently charging zero.
+    """
+    return PFOutcome(
+        converged=False, feasible=False, min_vm_pu=float("nan"), max_vm_pu=float("nan"),
+        max_line_loading_percent=float("nan"), max_trafo_loading_percent=float("nan"),
+        losses_kw=float("nan"), losses_percent=float("nan"), total_load_kw=float(total_load_kw),
+        active_bottleneck="power flow did not converge", error=error,
+    )
+
+
 def run_powerflow(model, constraints: Dict[str, float]) -> PFOutcome:
     net = model.net
     v_min = float(constraints["voltage_min_pu"])
@@ -33,14 +50,13 @@ def run_powerflow(model, constraints: Dict[str, float]) -> PFOutcome:
 
     try:
         pp.runpp(net, calculate_voltage_angles=False, init="flat")
-        converged = bool(net.converged)
     except Exception as exc:  # diverged / singular
-        return PFOutcome(
-            converged=False, feasible=False, min_vm_pu=float("nan"), max_vm_pu=float("nan"),
-            max_line_loading_percent=float("nan"), max_trafo_loading_percent=float("nan"),
-            losses_kw=float("nan"), losses_percent=float("nan"), total_load_kw=float(model.total_load_kw),
-            active_bottleneck="power flow did not converge", error=str(exc),
-        )
+        return _not_converged(model.total_load_kw, str(exc))
+
+    # pandapower normally raises on non-convergence, but the flag is authoritative: a
+    # non-raising non-convergence must never fall through to the limit checks below.
+    if not bool(getattr(net, "converged", False)):
+        return _not_converged(model.total_load_kw, "runpp returned without convergence")
 
     res_bus = net.res_bus
     res_line = net.res_line
@@ -48,6 +64,11 @@ def run_powerflow(model, constraints: Dict[str, float]) -> PFOutcome:
     max_vm = float(res_bus["vm_pu"].max()) if len(res_bus) else 1.0
     max_ll = float(res_line["loading_percent"].max()) if len(res_line) else 0.0
     max_tl = float(net.res_trafo["loading_percent"].max()) if len(net.res_trafo) else 0.0
+
+    # A converged solve with NaN state (singular island, unsupplied bus) is not a usable
+    # result either -- treat it as non-convergence rather than comparing NaN to a limit.
+    if any(math.isnan(v) for v in (min_vm, max_vm, max_ll, max_tl)):
+        return _not_converged(model.total_load_kw, "converged with non-finite bus/branch results")
 
     line_losses_kw = float(res_line["pl_mw"].sum()) * 1000.0 if len(res_line) else 0.0
     trafo_losses_kw = float(net.res_trafo["pl_mw"].sum()) * 1000.0 if len(net.res_trafo) else 0.0
@@ -80,4 +101,26 @@ def run_powerflow(model, constraints: Dict[str, float]) -> PFOutcome:
         max_line_loading_percent=max_ll, max_trafo_loading_percent=max_tl,
         losses_kw=losses_kw, losses_percent=losses_pct, total_load_kw=float(model.total_load_kw),
         active_bottleneck=bottleneck, overloaded_line_ids=overloaded, undervoltage_bus_indices=undervolt,
+    )
+
+
+def violation_severity(outcome: PFOutcome, constraints: Dict[str, float]) -> float:
+    """How far outside its limits a converged outcome sits (0.0 = within limits).
+
+    Sum of the per-limit breaches in comparable units: voltage breaches in pu, loading
+    breaches as a fraction of the limit. Used to rank *infeasible* candidates, where NPC
+    is not a meaningful ordering (a candidate that did not converge has no cost either).
+    ``inf`` for a non-converged outcome: nothing worse than an unsolvable network.
+    """
+    if outcome is None or not outcome.converged:
+        return float("inf")
+    v_min = float(constraints["voltage_min_pu"])
+    v_max = float(constraints["voltage_max_pu"])
+    max_line = float(constraints["max_line_loading_percent"])
+    max_trafo = float(constraints["max_transformer_loading_percent"])
+    return (
+        max(0.0, v_min - outcome.min_vm_pu)
+        + max(0.0, outcome.max_vm_pu - v_max)
+        + max(0.0, outcome.max_line_loading_percent - max_line) / 100.0
+        + max(0.0, outcome.max_trafo_loading_percent - max_trafo) / 100.0
     )

@@ -22,7 +22,7 @@ from core.topology.mvlv_service_zones import (
 )
 from core.electrical.pandapower_builder import build_lv_net, build_mvlv_net
 from core.electrical.conductor_sizing import size_conductors, critical_lv_lines
-from core.electrical.validation import run_powerflow
+from core.electrical.validation import run_powerflow, violation_severity
 from core.economics import cost_model as cm
 from core.economics.standalone import cluster_standalone
 from .result_models import CaseResult, MVPResult
@@ -60,7 +60,6 @@ def _size_flat_lv(topology, customers_df, lv_conductors, constraints, T, coincid
 
 
 def _now_powerflow(topology, customers_df, conductor_by_line, constraints, T, lv_kv, coincidence=1.0):
-    from core.electrical.validation import run_powerflow
     model = build_lv_net(topology, customers_df, conductor_by_line, lv_kv=lv_kv, horizon_years=T, apply_growth=False, coincidence_factor=coincidence)
     return model, run_powerflow(model, constraints)
 
@@ -602,6 +601,10 @@ def _comparison_row(res: CaseResult, customers_df) -> Dict[str, Any]:
         "architecture": res.architecture,
         "feasible": res.feasible,
         "npc_total": round(res.cost.total_npc, 0),
+        # False => npc_total omits an unknown component (see npc_missing_components) and is
+        # a LOWER BOUND, not comparable with a complete total.
+        "npc_complete": res.cost.npc_complete,
+        "npc_missing_components": "; ".join(res.cost.missing_components),
         "grid_capex": round(res.cost.grid_capex, 0),
         "generation_npc": round(res.cost.generation_npc, 0),
         "standalone_npc": round(res.cost.standalone_npc, 0),
@@ -723,6 +726,7 @@ def _cost_row(res: CaseResult) -> Dict[str, Any]:
         "standalone_npc": round(c.standalone_npc, 0), "loss_pv_cost": round(c.loss_pv_cost, 0),
         "generation_npc": round(c.generation_npc, 0),
         "total_npc": round(c.total_npc, 0),
+        "npc_complete": c.npc_complete,
     }
 
 
@@ -828,15 +832,38 @@ def run_simplified_mvp(
         if r.must_connect_violations > 0:
             r.feasible = False
 
-    # Recommendation: feasible candidate with the lowest NPC; else least-infeasible by NPC.
+    # Recommendation: feasible candidate with the lowest NPC; else the least-infeasible one.
+    #
+    # Ranking infeasible candidates by NPC would be wrong: a candidate whose power flow
+    # diverged has no computable loss cost, so its total is a lower bound and it would win
+    # the comparison precisely BECAUSE it is broken. Rank them by how close they are to
+    # being a usable network instead, and only use cost to break ties between candidates
+    # that are equally broken and equally costed.
     feasible_ids = [k for k, r in cases.items() if r.feasible]
     if feasible_ids:
         recommended = min(feasible_ids, key=lambda k: cases[k].cost.total_npc)
         note = f"Lowest-NPC feasible candidate: {recommended}"
     else:
-        recommended = min(cases, key=lambda k: cases[k].cost.total_npc)
-        bottleneck = cases[recommended].outcome_horizon.active_bottleneck if cases[recommended].outcome_horizon else "n/a"
-        note = f"No feasible candidate; least-infeasible by NPC: {recommended} ({bottleneck})"
+        def _infeasibility_rank(key: str):
+            r = cases[key]
+            o = r.outcome_horizon
+            return (
+                0 if (o is not None and o.converged) else 1,   # a solvable network first
+                r.must_connect_violations,                     # then service obligations
+                r.service_tier_violations,
+                violation_severity(o, constraints),            # then distance from the limits
+                0 if r.cost.npc_complete else 1,               # then a comparable cost
+                r.cost.total_npc,
+            )
+        recommended = min(cases, key=_infeasibility_rank)
+        rec = cases[recommended]
+        bottleneck = rec.outcome_horizon.active_bottleneck if rec.outcome_horizon else "n/a"
+        note = (
+            f"No feasible candidate; least-infeasible by violation severity: "
+            f"{recommended} ({bottleneck})"
+        )
+        if not rec.cost.npc_complete:
+            note += f" - NPC incomplete, missing {', '.join(rec.cost.missing_components)}"
 
     _log(log, "comparison", recommended, "recommendation", "select", note)
 
