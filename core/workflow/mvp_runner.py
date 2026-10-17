@@ -13,6 +13,7 @@ from core.io.load_inputs import customers_to_engine_gdf
 from core.topology.lv_topology import build_lv_topology
 from core.topology.branch_detection import Cluster, detect_lv_subtrees, subtree_clusters
 from core.topology.mvlv_service_zones import (
+    TRANSFORMER_SIZING_SAFETY_FACTOR,
     _coords_and_ids,
     build_mvlv_plan,
     build_stepup_spec,
@@ -26,13 +27,6 @@ from core.electrical.validation import run_powerflow, violation_severity
 from core.economics import cost_model as cm
 from core.economics.standalone import cluster_standalone
 from .result_models import CaseResult, MVPResult
-
-
-# The single transformer sizing safety factor. It appears twice by design: once as the
-# target in ``select_transformer`` (1.2 * S_zone) and once as the divisor on the zone kVA
-# cap, so that a zone at the cap remains coverable by the largest catalogue unit. One
-# margin, two consistent uses -- not a compounded 1.44.
-TRANSFORMER_SIZING_SAFETY_FACTOR = 1.2
 
 
 def _log(log: List[Dict[str, Any]], step, candidate, obj, decision, reason, metric="", value="", threshold="") -> None:
@@ -417,7 +411,20 @@ def _k_search_stop(n_zones: int, reason: str) -> Dict[str, Any]:
     }
 
 
-def _build_mvlv_at(ctx, groups: List[List[str]], stepup_spec: Dict[str, Any]) -> Dict[str, Any]:
+def _mvlv_net(ctx, plan, zone_cond, mv_cond, transformer_by_zone, stepup_spec,
+              *, apply_growth: bool, coincidence: float):
+    """Build one MV/LV pandapower model. The three snapshots differ only in these two args."""
+    return build_mvlv_net(
+        plan, ctx["customers"], zone_conductor_by_line=zone_cond,
+        mv_conductor=mv_cond, transformer_by_zone=transformer_by_zone,
+        lv_kv=ctx["lv_kv"], mv_kv=ctx["mv_kv"], horizon_years=ctx["T"],
+        apply_growth=apply_growth, stepup_transformer=stepup_spec,
+        coincidence_factor=coincidence, source_vm_pu=ctx["source_vm_pu"],
+    )
+
+
+def _build_mvlv_at(ctx, groups: List[List[str]], stepup_spec: Dict[str, Any],
+                   *, with_stress: bool = False) -> Dict[str, Any]:
     """Build plan + per-zone LV sizing + MV-rank sweep + horizon PF for a FIXED partition.
 
     The transformer count is whatever ``groups`` contains; the caller decides how ``groups``
@@ -446,31 +453,54 @@ def _build_mvlv_at(ctx, groups: List[List[str]], stepup_spec: Dict[str, Any]) ->
         cached = sizing_cache.get(cache_key)
         if cached is None:
             zsizing = _size_flat_lv(ztopo, ctx["customers"], ctx["lv_conductors"], constraints, T, ctx["coincidence"])
-            ztopo.bus_by_pole = zsizing.model.bus_by_pole
-            cached = dict(zsizing.conductor_by_line)
+            cached = {"conductors": dict(zsizing.conductor_by_line),
+                      "bus_by_pole": dict(zsizing.model.bus_by_pole)}
             sizing_cache[cache_key] = cached
-        for lid, c in cached.items():
+        # Set on the HIT path too. The cache hands back the same LVTopology instance to every
+        # attempt and to both the Case C and Case D plans, so assigning bus_by_pole only on a
+        # miss left it holding whatever the last build wrote -- correct today only because
+        # nothing reads it for zone candidates (detect_mvlv_subtree_candidates passes
+        # full_model=None), which is an invariant nothing states.
+        ztopo.bus_by_pole = cached["bus_by_pole"]
+        for lid, c in cached["conductors"].items():
             zone_cond[f"{zone['zone_id']}::{lid}"] = c
         transformers_chosen.append({**zone["transformer_spec"], "zone_id": zone["zone_id"], "transformer_id": zone["transformer_id"]})
 
     transformer_by_zone = {z["zone_id"]: z["transformer_spec"] for z in plan.zones}
     final_model = final_outcome = mv_cond = None
+    # Positional order IS rank order: normalize_conductors sorts by `rank` and resets the
+    # index, so iloc[i] is the i-th cheapest. Sweep cheapest-first until the network passes.
     for rank_i in range(len(ctx["mv_conductors"])):
         mv_cond = ctx["mv_conductors"].iloc[rank_i].to_dict()
-        final_model = build_mvlv_net(
-            plan, ctx["customers"], zone_conductor_by_line=zone_cond,
-            mv_conductor=mv_cond, transformer_by_zone=transformer_by_zone,
-            lv_kv=ctx["lv_kv"], mv_kv=ctx["mv_kv"], horizon_years=T, apply_growth=True,
-            stepup_transformer=stepup_spec, coincidence_factor=ctx["coincidence"],
-            source_vm_pu=ctx["source_vm_pu"],
-        )
+        final_model = _mvlv_net(ctx, plan, zone_cond, mv_cond, transformer_by_zone, stepup_spec,
+                                apply_growth=True, coincidence=ctx["coincidence"])
         final_outcome = run_powerflow(final_model, constraints)
         if final_outcome.feasible:
             break
 
-    return {"plan": plan, "zone_cond": zone_cond, "transformers": transformers_chosen,
-            "transformer_by_zone": transformer_by_zone, "mv_cond": mv_cond,
-            "model": final_model, "outcome": final_outcome}
+    built = {"plan": plan, "zone_cond": zone_cond, "transformers": transformers_chosen,
+             "transformer_by_zone": transformer_by_zone, "mv_cond": mv_cond,
+             "model": final_model, "outcome": final_outcome,
+             "stress_model": None, "stress_outcome": None}
+    if with_stress:
+        built.update(_mvlv_stress(ctx, built, stepup_spec))
+    return built
+
+
+def _mvlv_stress(ctx, built: Dict[str, Any], stepup_spec: Dict[str, Any]) -> Dict[str, Any]:
+    """Coincident-peak snapshot: the same network with every customer at horizon peak at once.
+
+    Kept separate from :func:`_build_mvlv_at` because it costs an extra power flow per
+    partition and is only needed for the candidate that is finally reported -- unless
+    ``k_selection_snapshot="coincident"``, in which case the zone-count search selects on it
+    and every attempt needs it. That option used to raise ``KeyError: 'stress_outcome'``: the
+    search read a key only added one level up, after the search had already finished.
+    """
+    model = _mvlv_net(
+        ctx, built["plan"], built["zone_cond"], built["mv_cond"], built["transformer_by_zone"],
+        stepup_spec, apply_growth=True, coincidence=1.0,
+    )
+    return {"stress_model": model, "stress_outcome": run_powerflow(model, ctx["constraints"])}
 
 
 def _voltage_cap_search(ctx, grid_ids, crs_epsg, max_kva, max_transformers, stepup_spec, seed):
@@ -551,7 +581,7 @@ def _voltage_cap_search(ctx, grid_ids, crs_epsg, max_kva, max_transformers, step
                 coincidence_factor=ctx["tx_coincidence"],
             )
             attempts_made += 1
-            built = _build_mvlv_at(ctx, groups, stepup_spec)
+            built = _build_mvlv_at(ctx, groups, stepup_spec, with_stress=on_coincident)
         except ValueError as exc:
             # Too few distinct locations for this many zones, or a degenerate geometry.
             iterations.append(_k_search_failure(n_zones, "unbuildable", str(exc)))
@@ -560,6 +590,7 @@ def _voltage_cap_search(ctx, grid_ids, crs_epsg, max_kva, max_transformers, step
         return built
 
     def selection_outcome(built):
+        """The snapshot the ACCEPTANCE test reads (the design one unless selecting on stress)."""
         return built["stress_outcome"] if on_coincident else built["outcome"]
 
     def is_feasible(built) -> bool:
@@ -656,10 +687,12 @@ def _voltage_cap_search(ctx, grid_ids, crs_epsg, max_kva, max_transformers, step
         note = f"smallest zone count holding v_min >= {v_target:.3f} pu"
     elif feasible_ks:
         chosen_k = feasible_ks[0]
+        solved = [selection_outcome(b) for b in built_by_k.values()]
+        best_vm = max((float(o.min_vm_pu) for o in solved if o is not None and o.converged),
+                      default=float("nan"))
         note = (
             f"design voltage margin of {margin:.3f} pu unreachable at any zone count "
-            f"(best {max((float(selection_outcome(b).min_vm_pu)) for b in built_by_k.values() if selection_outcome(b).converged):.3f} pu); "
-            f"fell back to the smallest feasible count"
+            f"(best {best_vm:.3f} pu); fell back to the smallest feasible count"
         )
     else:
         chosen_k = min(
@@ -738,17 +771,11 @@ def _build_mvlv(ctx, grid_ids: List[str]) -> Dict[str, Any]:
     plan.mv_iterations = iterations
     plan.selection_note = best.get("selection_note", "")
 
-    # Coincident-peak stress: same network + chosen MV conductor, every customer at horizon peak
-    # simultaneously (factor 1.0). Reported alongside the design outcome, not used to gate feasibility.
-    stress_model = build_mvlv_net(
-        plan, ctx["customers"], zone_conductor_by_line=best["zone_cond"],
-        mv_conductor=best["mv_cond"], transformer_by_zone=best["transformer_by_zone"],
-        lv_kv=ctx["lv_kv"], mv_kv=ctx["mv_kv"], horizon_years=T, apply_growth=True,
-        stepup_transformer=stepup_spec, coincidence_factor=1.0, source_vm_pu=ctx["source_vm_pu"],
-    )
-    stress_outcome = run_powerflow(stress_model, ctx["constraints"])
-    return {**best, "stepup": stepup_spec, "stress_model": stress_model,
-            "stress_outcome": stress_outcome, "iterations": iterations}
+    # Coincident-peak stress, reported alongside the design outcome and never gating it. The
+    # search already solved it when selecting on it; otherwise solve it once, for the winner.
+    if best.get("stress_outcome") is None:
+        best.update(_mvlv_stress(ctx, best, stepup_spec))
+    return {**best, "stepup": stepup_spec, "iterations": iterations}
 
 
 def _run_mvlv(ctx, grid_ids: List[str], *, cid: str = "C_MVLV", architecture: str = "MV/LV",
@@ -805,13 +832,11 @@ def _run_mvlv(ctx, grid_ids: List[str], *, cid: str = "C_MVLV", architecture: st
     _log(ctx["log"], "conductor_sizing", cid, "mv_trunk", "pass" if final_outcome.feasible else "fail",
          final_outcome.active_bottleneck, "mv_conductor", str((mv_cond or {}).get("conductor_id")))
 
-    now_model = build_mvlv_net(
-        plan, ctx["customers"], zone_conductor_by_line=zone_cond,
-        mv_conductor=mv_cond, transformer_by_zone={z["zone_id"]: z["transformer_spec"] for z in plan.zones},
-        lv_kv=ctx["lv_kv"], mv_kv=ctx["mv_kv"], horizon_years=T, apply_growth=False,
-        stepup_transformer=stepup, source_vm_pu=ctx["source_vm_pu"],
-        coincidence_factor=ctx["coincidence"],
-    )
+    # Reuse the stored transformer_by_zone rather than re-deriving it: if zone transformer
+    # selection ever stops being a pure function of plan.zones, re-deriving would build the
+    # "now" snapshot against different transformers than the horizon one beside it.
+    now_model = _mvlv_net(ctx, plan, zone_cond, mv_cond, built["transformer_by_zone"], stepup,
+                          apply_growth=False, coincidence=ctx["coincidence"])
     now = run_powerflow(now_model, ctx["constraints"])
 
     cost = cm.CostBreakdown()

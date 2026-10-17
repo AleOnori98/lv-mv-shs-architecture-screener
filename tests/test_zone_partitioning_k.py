@@ -212,8 +212,12 @@ def test_k_search_records_the_margin_it_selected_against(mvp):
     # Every attempt reports the voltage target it was judged against, so the accepted
     # zone count is auditable rather than implicit.
     assert rows["metric_value"].str.contains("target").all()
+    # The full verdict set the logger can emit. The earlier version of this assertion
+    # omitted search_stopped / unbuildable and passed only because the fixture never hits
+    # the attempt budget -- a test that asserted less than the code can do.
     assert rows["decision"].isin(
-        {"accepted", "feasible_no_margin", "infeasible", "diverged"}
+        {"accepted", "feasible_no_margin", "infeasible", "diverged",
+         "search_stopped", "unbuildable"}
     ).all()
 
 
@@ -287,3 +291,43 @@ def test_k_search_respects_its_attempt_budget(inputs):
         assert n_built <= 3, f"{cid} built {n_built} zone counts against a budget of 3"
     # And the truncation is recorded rather than silent.
     assert (rows["decision"] == "search_stopped").any()
+
+
+def test_selecting_the_zone_count_on_the_coincident_snapshot_works(inputs):
+    """k_selection_snapshot="coincident" used to raise KeyError: 'stress_outcome'.
+
+    The option is schema-defaulted, validated against an allow-list, threaded through the
+    engineering overrides, exposed as a Streamlit selectbox and documented in three places --
+    but the search read a key that only existed one level up, added after the search had
+    finished, and nothing exercised it.
+    """
+    from core.workflow.mvp_runner import run_simplified_mvp
+
+    params = dict(inputs["cost_parameters"])
+    params["k_selection_snapshot"] = "coincident"
+    res = run_simplified_mvp(
+        inputs["customers"], inputs["roads"], inputs["source"], inputs["lv_conductors"],
+        inputs["mv_conductors"], inputs["transformers"], inputs["standalone_packages"],
+        params, {"max_user_connection_radius_m": 35, "max_users_per_pole": 16,
+                 "max_pole_span_m": 50, "road_pole_spacing_m": 40},
+    )
+
+    case = res.cases["C_MVLV"]
+    assert case.plan is not None and case.n_transformers >= 1
+    # Selecting on the stress snapshot means it must exist for the reported candidate too.
+    assert case.outcome_stress is not None and case.outcome_stress.converged
+    # And the stress snapshot is the stricter one, so it can never read better than design.
+    assert case.outcome_stress.min_vm_pu <= case.outcome_horizon.min_vm_pu
+
+
+def test_one_sizing_margin_is_shared_by_cap_and_selection():
+    """The "one margin, two uses" claim is structural, not three drifting defaults."""
+    import inspect
+
+    from core.topology import mvlv_service_zones as mz
+
+    assert mz.TRANSFORMER_SIZING_SAFETY_FACTOR == 1.2
+    for fn, param in ((mz.select_transformer, "safety_factor"),
+                      (mz.build_stepup_spec, "sizing_margin")):
+        default = inspect.signature(fn).parameters[param].default
+        assert default is mz.TRANSFORMER_SIZING_SAFETY_FACTOR, fn.__name__

@@ -31,6 +31,13 @@ from .lv_topology import LVTopology, build_lv_topology
 
 _HULL_MIN_POINTS = 500  # above this cluster size, reduce to convex-hull vertices before pdist
 
+# The single transformer sizing margin. It is used twice, consistently: as the target in
+# ``select_transformer`` (cover 1.2 * S_zone) and as the divisor on the zone kVA cap, so a
+# zone sitting exactly at the cap is still coverable by the largest catalogue unit. That is
+# ONE margin with two uses, not a compounded 1.44 -- and it is a single constant so the
+# claim is structural rather than three independent defaults that can drift apart.
+TRANSFORMER_SIZING_SAFETY_FACTOR = 1.2
+
 
 @dataclass
 class MVLVPlan:
@@ -77,7 +84,12 @@ def zone_apparent_power_kva(
     return math.sqrt(float(p.sum()) ** 2 + float(q.sum()) ** 2)
 
 
-def select_transformer(s_zone_kva: float, transformers_df: pd.DataFrame, *, safety_factor: float = 1.2) -> Dict[str, Any]:
+def select_transformer(
+    s_zone_kva: float,
+    transformers_df: pd.DataFrame,
+    *,
+    safety_factor: float = TRANSFORMER_SIZING_SAFETY_FACTOR,
+) -> Dict[str, Any]:
     """Smallest transformer (lowest rank) covering the zone with a sizing safety margin.
 
     The margin accounts for losses/reactive flow (which raise the real loading a few percent
@@ -411,7 +423,7 @@ def build_stepup_spec(
     *,
     mv_kv: float,
     lv_kv: float,
-    sizing_margin: float = 1.2,
+    sizing_margin: float = TRANSFORMER_SIZING_SAFETY_FACTOR,
 ) -> Dict[str, Any]:
     """Electrical spec for the plant LV->MV step-up transformer.
 
