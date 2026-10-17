@@ -108,7 +108,9 @@ def test_avoided_lv_cost_includes_service_drops_and_losses():
     )
     expected = expected_base + cm.loss_present_value(1.0, params)
 
-    assert _avoided_lv_cost(cluster, ctx) == pytest.approx(expected)
+    # The screen cuts this subtree out of a grid set that is exactly its own customers, so
+    # the marginal avoided generation equals their slice (true for any separable model).
+    assert _avoided_lv_cost(cluster, ctx, ["C1", "C2"]) == pytest.approx(expected)
 
 
 def test_service_drops_are_charged_as_well_as_credited():

@@ -26,6 +26,7 @@ from core.electrical.pandapower_builder import build_lv_net, build_mvlv_net
 from core.electrical.conductor_sizing import size_conductors, critical_lv_lines
 from core.electrical.validation import run_powerflow, violation_severity
 from core.economics import cost_model as cm
+from core.economics import generation as gen
 from core.economics.standalone import cluster_standalone
 from .result_models import CaseResult, MVPResult
 
@@ -119,6 +120,8 @@ def build_context(
         "coincidence": float(params["coincidence_factor"]),
         # Catalogue lookups that are invariant for the whole run.
         "cheapest_lv_cost_per_m": cm.cheapest_lv_cost_per_m(lv_conductors),
+        # The generation-cost model (flat LCOE today; see core.economics.generation).
+        "generation_model": gen.model_from_parameters(params),
         # Diversity basis for transformer sizing / the zone kVA cap; 0 means "track the
         # design coincidence factor" (see transformer_sizing_coincidence_factor).
         "tx_coincidence": (
@@ -148,22 +151,32 @@ def _energy_weighted_growth(ctx, customer_ids) -> float:
     return (weighted / total) if total > 0 else 0.0
 
 
-def _generation_npc(ctx, grid_ids) -> float:
-    """PV of mini-grid generation cost for the given grid-served customers (see cost_model).
+def _served_energy(ctx, customer_ids) -> gen.ServedEnergy:
+    """Aggregate a customer set into the demand a generation plant must supply."""
+    return gen.served_energy_for(customer_ids, ctx["annual_kwh_by_id"], ctx["growth_by_id"])
 
-    Uses each customer's own growth rate exactly (not the weighted mean), since the sum of
-    per-customer PVs is exact and just as cheap here.
+
+def _generation_npc(ctx, grid_ids) -> float:
+    """PV of generating a candidate's grid-served energy (see :mod:`core.economics.generation`)."""
+    return ctx["generation_model"].present_value(
+        _served_energy(ctx, grid_ids), horizon_years=ctx["T"], discount_rate=ctx["discount"],
+    )
+
+
+def _avoided_generation_npc(ctx, grid_ids, leaving_ids) -> float:
+    """Generation cost avoided by taking ``leaving_ids`` off the grid-served set.
+
+    A difference between two plant designs rather than the departing customers' own slice.
+    The two are identical for a flat LCOE, and only the difference stays correct once
+    generation is sized and dispatched against the aggregate load.
     """
-    kwh_by_id, growth_by_id = ctx["annual_kwh_by_id"], ctx["growth_by_id"]
-    total = 0.0
-    for c in grid_ids:
-        key = str(c)
-        kwh = kwh_by_id.get(key, 0.0)
-        if kwh:
-            total += cm.generation_present_value(
-                kwh, ctx["params"], growth_rate=growth_by_id.get(key, 0.0)
-            )
-    return total
+    leaving = set(map(str, leaving_ids))
+    return gen.avoided_present_value(
+        ctx["generation_model"],
+        _served_energy(ctx, grid_ids),
+        _served_energy(ctx, [c for c in grid_ids if str(c) not in leaving]),
+        horizon_years=ctx["T"], discount_rate=ctx["discount"],
+    )
 
 
 def _loss_npc(ctx, losses_kw, grid_ids) -> float:
@@ -274,7 +287,7 @@ def _run_full_lv(ctx) -> CaseResult:
 # Case B — LV + Stand-alone
 # ---------------------------------------------------------------------------
 
-def _avoided_grid_cost(cluster: Cluster, ctx, *, include_losses: bool) -> float:
+def _avoided_grid_cost(cluster: Cluster, ctx, grid_ids, *, include_losses: bool) -> float:
     """Grid cost avoided if a candidate subtree's customers all move to stand-alone.
 
     All terms are *marginal* to that subtree:
@@ -293,24 +306,26 @@ def _avoided_grid_cost(cluster: Cluster, ctx, *, include_losses: bool) -> float:
     service_drop_cost = _service_drop_cost(ctx, float(cluster.metadata.get("service_drop_m", 0.0)))
     conn = cm.connection_capex(cluster.n_customers, params)
     pole_cost = cm.pole_capex(len(cluster.pole_ids), params["pole_cost"], mult)
-    generation_pv = _generation_npc(ctx, cluster.customer_ids)
+    # Marginal against the whole grid-served set this screen is cutting from, not the
+    # subtree's own slice (identical today; correct under a sizing/dispatch model).
+    generation_pv = _avoided_generation_npc(ctx, grid_ids, cluster.customer_ids)
     avoided = cluster.branch_cost + service_drop_cost + conn + pole_cost + generation_pv
     if include_losses:
         avoided += _loss_npc(ctx, getattr(cluster, "branch_losses_kw", 0.0), cluster.customer_ids)
     return float(avoided)
 
 
-def _avoided_lv_cost(cluster: Cluster, ctx) -> float:
+def _avoided_lv_cost(cluster: Cluster, ctx, grid_ids) -> float:
     """Case B: avoided grid generation PV + avoided branch-loss PV (sliced from the solved
     Full-LV power flow)."""
-    return _avoided_grid_cost(cluster, ctx, include_losses=True)
+    return _avoided_grid_cost(cluster, ctx, grid_ids, include_losses=True)
 
 
-def _avoided_mvlv_subtree_cost(cluster: Cluster, ctx) -> float:
+def _avoided_mvlv_subtree_cost(cluster: Cluster, ctx, grid_ids) -> float:
     """Case D: avoided grid generation PV is credited (as in Case B). Still conservative on the
     electrical side — branch losses are not sliced per subtree, and the zone transformer / MV
     service drop are credited only via the rebuild (an evacuated zone is simply not re-created)."""
-    return _avoided_grid_cost(cluster, ctx, include_losses=False)
+    return _avoided_grid_cost(cluster, ctx, grid_ids, include_losses=False)
 
 
 class StandaloneSelection(NamedTuple):
@@ -326,7 +341,8 @@ class StandaloneSelection(NamedTuple):
     npc: float
 
 
-def _select_standalone_clusters(ctx, clusters, avoided_cost_fn, architecture_label, cid) -> StandaloneSelection:
+def _select_standalone_clusters(ctx, clusters, avoided_cost_fn, architecture_label, cid,
+                                grid_ids) -> StandaloneSelection:
     """Screen candidate subtrees and pick stand-alone where SHS NPC < avoided grid cost.
 
     Shared by the LV screen (Case B) and the MV/LV screen (Case D). Each candidate exposes
@@ -350,7 +366,7 @@ def _select_standalone_clusters(ctx, clusters, avoided_cost_fn, architecture_lab
     # Only eligible candidates can be selected, and the ordering only matters among those,
     # so ineligible ones are not priced at all.
     eligible = [cl for cl in clusters if cl.standalone_eligible_precheck]
-    avoided_by = {id(cl): avoided_cost_fn(cl, ctx) for cl in eligible}
+    avoided_by = {id(cl): avoided_cost_fn(cl, ctx, grid_ids) for cl in eligible}
     for cl in sorted(eligible, key=lambda c: avoided_by[id(c)], reverse=True):
         if any(c in claimed for c in cl.customer_ids):  # a coarser subtree already took these
             continue
@@ -1178,7 +1194,10 @@ def run_simplified_mvp(
              "n_customers", cl.n_customers)
 
     emit("Building LV + stand-alone case (LV leaf-branch SHS screen)...")
-    lv_sa = _select_standalone_clusters(ctx, lv_clusters, _avoided_lv_cost, "LV + Stand-alone", "B_LV_plus_standalone")
+    lv_sa = _select_standalone_clusters(
+        ctx, lv_clusters, _avoided_lv_cost, "LV + Stand-alone", "B_LV_plus_standalone",
+        full_res.grid_customer_ids,
+    )
     sa_res = _run_lv_standalone(ctx, full_res, lv_sa)
 
     # Case D: MV/LV screen over the terminal subtrees inside each zone's LV tree (own SHS set, not B's).
@@ -1188,7 +1207,10 @@ def run_simplified_mvp(
         _log(log, "mvlv_subtree", "C_MVLV", cl.cluster_id,
              "flagged" if cl.is_problematic else "clean", "; ".join(cl.reasons) or "within limits",
              "n_customers", cl.n_customers)
-    mvlv_sa = _select_standalone_clusters(ctx, mvlv_clusters, _avoided_mvlv_subtree_cost, "MV/LV + Stand-alone", "D_MVLV_plus_standalone")
+    mvlv_sa = _select_standalone_clusters(
+        ctx, mvlv_clusters, _avoided_mvlv_subtree_cost, "MV/LV + Stand-alone",
+        "D_MVLV_plus_standalone", mvlv_res.grid_customer_ids,
+    )
     mvlv_sa_res = _run_mvlv_standalone(ctx, full_res, mvlv_sa)
 
     cases = {

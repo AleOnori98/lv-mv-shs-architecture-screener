@@ -39,18 +39,18 @@ def test_select_standalone_screen_is_purely_economic(mvp, inputs):
     cand = SimpleNamespace(cluster_id="X", customer_ids=ids, standalone_eligible_precheck=True)
 
     # Avoided cost dominates SHS NPC -> selected.
-    sel, assign, npc = _select_standalone_clusters(ctx, [cand], lambda c, x: 1e15, "Arch", "CID")
+    sel, assign, npc = _select_standalone_clusters(ctx, [cand], lambda c, x, g: 1e15, "Arch", "CID", [])
     assert set(sel) == set(ids) and npc > 0
     assert all(a["architecture"] == "Arch" and a["cluster_id"] == "X" and a["status"] == "standalone"
                for a in assign.values())
 
     # Zero avoided cost -> grid cheaper -> kept.
-    sel2, _, npc2 = _select_standalone_clusters(ctx, [cand], lambda c, x: 0.0, "Arch", "CID")
+    sel2, _, npc2 = _select_standalone_clusters(ctx, [cand], lambda c, x, g: 0.0, "Arch", "CID", [])
     assert sel2 == [] and npc2 == 0.0
 
     # Eligibility precheck (feasibility) is the only non-economic gate.
     blocked = SimpleNamespace(cluster_id="Y", customer_ids=ids, standalone_eligible_precheck=False)
-    sel3, _, _ = _select_standalone_clusters(ctx, [blocked], lambda c, x: 1e15, "Arch", "CID")
+    sel3, _, _ = _select_standalone_clusters(ctx, [blocked], lambda c, x, g: 1e15, "Arch", "CID", [])
     assert sel3 == []
 
 
@@ -64,7 +64,8 @@ def test_select_standalone_greedy_no_double_claim(mvp, inputs):
     parent = SimpleNamespace(cluster_id="P", customer_ids=ids, standalone_eligible_precheck=True)
     child = SimpleNamespace(cluster_id="C", customer_ids=ids[:1], standalone_eligible_precheck=True)
     sel, assign, _ = _select_standalone_clusters(
-        ctx, [child, parent], lambda c, x: 1e15 if c.cluster_id == "P" else 1e14, "Arch", "CID")
+        ctx, [child, parent], lambda c, x, g: 1e15 if c.cluster_id == "P" else 1e14,
+        "Arch", "CID", [])
     assert set(sel) == set(ids)
     assert all(a["cluster_id"] == "P" for a in assign.values())  # parent took both; child skipped
 
