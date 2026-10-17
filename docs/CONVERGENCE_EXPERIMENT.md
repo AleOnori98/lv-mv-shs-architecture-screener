@@ -154,6 +154,7 @@ by which package each household qualifies for**, more than by the generation cur
   recommended design up to 3.8% more expensive, and in one case infeasible.
 - **The biggest levers are outside the curve:** the SHS package catalogue, the eligibility
   tolerance, and a service-quality term that compares an SHS tier fairly with a grid connection.
+  The plan for these is in [`SERVICE_QUALITY_ROADMAP.md`](SERVICE_QUALITY_ROADMAP.md).
 
 ## Caveats
 

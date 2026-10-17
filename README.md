@@ -21,7 +21,9 @@ It reuses a road-pole + **MST** topology engine and validates every network with
 [`docs/MODEL_REFERENCE.md`](docs/MODEL_REFERENCE.md) — exact parameters, variables & equations ·
 [`docs/METHODOLOGY_ENGINES.md`](docs/METHODOLOGY_ENGINES.md) — the three engines, engine by engine ·
 [`docs/PIPELINE_REVIEW.md`](docs/PIPELINE_REVIEW.md) — **known weaknesses and maturity assessment
-(read this before citing a number)**.
+(read this before citing a number)** ·
+[`docs/SERVICE_QUALITY_ROADMAP.md`](docs/SERVICE_QUALITY_ROADMAP.md) — SHS cost calibration, service
+tiers and policy outputs (next steps).
 
 ---
 

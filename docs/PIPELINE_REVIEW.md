@@ -382,6 +382,9 @@ Three structural prerequisites, in order:
 5. §3.6 and §3.7 — unify the avoided-cost and NPC models; add package-sizing tolerance.
 6. Then profiles → emergent diversity → MicroGridsPy loop (§5.1), with the energy-cost refactor
    shared with the on-grid work (§5.2).
+7. SHS cost calibration, service tiers and policy outputs: see
+   [`SERVICE_QUALITY_ROADMAP.md`](SERVICE_QUALITY_ROADMAP.md). The bottom-up SHS cost follows the
+   RAMP integration; the tier and switching-value outputs can go first.
 
 Steps 1–3 are prerequisites for trusting any number the model currently prints; 4–5 are
 prerequisites for the coupling loop converging to something meaningful.
