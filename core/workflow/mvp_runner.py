@@ -164,17 +164,25 @@ def _generation_npc(ctx, grid_ids) -> float:
 
 
 def _avoided_generation_npc(ctx, grid_ids, leaving_ids) -> float:
-    """Generation cost avoided by taking ``leaving_ids`` off the grid-served set.
+    """Generation cost of serving ``leaving_ids`` on top of the rest of ``grid_ids``.
 
-    A difference between two plant designs rather than the departing customers' own slice.
-    The two are identical for a flat LCOE, and only the difference stays correct once
-    generation is sized and dispatched against the aggregate load.
+    ``cost(grid ∪ branch) - cost(grid minus branch)``: the difference between the plant with
+    and without the branch. A difference of two plant designs rather than the branch's own
+    slice -- identical for a flat LCOE, and the only form that stays correct once generation
+    is sized and dispatched against the aggregate load.
+
+    Written as a union/difference so it holds in BOTH directions. In a single screening pass
+    every branch starts on the grid, so ``grid minus branch`` alone would do. In an iterated
+    coupling loop a branch taken off-grid in an earlier round must be re-asked whether it
+    should stay off, and ``cost(grid) - cost(grid - branch)`` is then ``cost(S) - cost(S) =
+    0``: the branch would see no generation credit at all, making reconnection look free.
     """
     leaving = set(map(str, leaving_ids))
+    rest = [c for c in grid_ids if str(c) not in leaving]
     return gen.avoided_present_value(
         ctx["generation_model"],
-        _served_energy(ctx, grid_ids),
-        _served_energy(ctx, [c for c in grid_ids if str(c) not in leaving]),
+        _served_energy(ctx, rest + sorted(leaving)),
+        _served_energy(ctx, rest),
         horizon_years=ctx["T"], discount_rate=ctx["discount"],
     )
 

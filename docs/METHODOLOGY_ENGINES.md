@@ -412,7 +412,7 @@ global optimum. After selection, the grid is **rebuilt and resized** on the rema
 | Service drops **credited and charged** (fixed) | The avoided cost credited avoided service drops while no candidate NPC charged them, so the gate was paid for a saving the objective did not recognise. Both sides now call the same helper on the same metres. |
 | Avoided cost **credits avoided grid *generation*** (updated) | Both screens now credit the PV of grid generation LCOE the departing customers no longer draw — the largest previously-missing term. This makes the gate the true break-even and selects more SHS; a residual marginal-vs-joint gap in the *topology* terms remains (see §3.6 Q2). |
 | SHS = **catalogue package**, not a dispatch model | No solar resource, battery autonomy, or reliability modelling; NPC via capex+O&M+replacement−salvage. |
-| Grid generation priced at **flat 0.25 MU/kWh LCOE** | This term **dominates** total NPC and drives the grid-vs-SHS balance; high sensitivity. |
+| Grid generation priced at **flat 0.25 MU/kWh LCOE** | This term **dominates** total NPC and drives the grid-vs-SHS balance; high sensitivity to the price *level* (SHS_T2 ≈ 0.22/kWh), little to the curve's shape at this price ([`CONVERGENCE_EXPERIMENT.md`](CONVERGENCE_EXPERIMENT.md)). |
 | **All-or-nothing** eligibility per subtree | One must-connect / ineligible customer vetoes an otherwise-attractive branch. |
 
 ### 3.6 Open questions for the supervisor (Engine 3)

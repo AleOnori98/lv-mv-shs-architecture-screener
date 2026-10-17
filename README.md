@@ -68,9 +68,11 @@ CSV / GeoJSON ─▶ load_inputs ─▶ customers_to_engine_gdf
 > ⚠️ **The generation LCOE dominates.** On every bundled case study `generation_npc` is **63–85% of
 > `total_npc`**, and it is *identical between network architectures* (A and C agree to the euro) —
 > so it cannot discriminate LV from MV/LV while completely setting the grid-vs-SHS balance. The SHS
-> screen currently accepts **every** candidate branch on the real cases. Treat the architecture
-> ranking as indicative until a generation model replaces the flat LCOE; see
-> [`docs/PIPELINE_REVIEW.md`](docs/PIPELINE_REVIEW.md) §3.1.
+> screen currently accepts **every** candidate branch on the real cases, because the grid price
+> is above the SHS cost per kWh, not because the flat LCOE lacks scale economies. Treat the
+> architecture ranking as indicative until a generation model replaces the flat LCOE; see
+> [`docs/PIPELINE_REVIEW.md`](docs/PIPELINE_REVIEW.md) §3.1 and
+> [`docs/CONVERGENCE_EXPERIMENT.md`](docs/CONVERGENCE_EXPERIMENT.md).
 
 ---
 
@@ -220,7 +222,8 @@ attempted transformer count with the voltage target it was judged against.
   single peak-power snapshot is used (no hourly/time-series dispatch).
 - Mini-grid generation is costed with **one flat LCOE** applied to grid-served energy (and, by
   default, to its losses) — a proxy for a dispatch/generation model, not an hourly production
-  simulation. It has **no economies of scale**, which is why the SHS screen no longer discriminates.
+  simulation. It has **no economies of scale**; on Mafa that does not change the SHS screen at the
+  dataset price (see [`docs/CONVERGENCE_EXPERIMENT.md`](docs/CONVERGENCE_EXPERIMENT.md)).
 - SHS packages carry **no reliability / autonomy term**, so a grid connection and an SHS are compared
   on cost alone without equalising service quality.
 - Avoided costs are **marginal estimates on the pre-removal network** while each candidate is a full

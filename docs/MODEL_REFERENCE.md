@@ -419,9 +419,10 @@ order               = descending avoided cost; a customer already claimed by a s
 
 > **Known limitation.** The gate currently accepts **every** candidate branch on the real case
 > studies (17/17 in Case B, 22/22 in Case D on Mafa). Avoided *generation* dominates the avoided
-> cost, and a flat LCOE has no economies of scale, so nothing restores the balance as load leaves
-> the grid. See `PIPELINE_REVIEW.md` §3.1 and §5.1 — this is the gap the MicroGridsPy coupling must
-> close, and it is not fixable inside the cost model.
+> cost, and at 0.25 MU/kWh the grid price sits above what SHS_T2 costs per kWh (≈ 0.22 levelised),
+> with no service-quality term to separate the two. The flat LCOE's lack of scale economies is
+> **not** the cause: realistic synthetic curves leave the Mafa answer unchanged, and the coupled
+> loop converges in 2–3 rounds. See [`CONVERGENCE_EXPERIMENT.md`](CONVERGENCE_EXPERIMENT.md).
 
 Avoided costs are **marginal estimates on the pre-removal network**, while the realised candidate is
 a full rebuild (Case D even re-partitions from scratch), so realised savings differ from credited

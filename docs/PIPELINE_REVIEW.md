@@ -124,6 +124,11 @@ screening; it is applying a uniform policy whose single free parameter is the LC
 **This is exactly the gap the MicroGridsPy coupling must close**, and it also means the current
 results are not a defensible baseline to iterate from. See §5.
 
+> *Update.* The synthetic-curve experiment ([`CONVERGENCE_EXPERIMENT.md`](CONVERGENCE_EXPERIMENT.md))
+> shows a scale-economy curve alone does **not** undo this on Mafa at 0.25 €/kWh: the price *level*
+> against the SHS cost per kWh (and SHS package eligibility) decides it. The coupling is still
+> needed to get the price right, but a service-quality term and the package catalogue matter as much.
+
 ### 3.2 Non-convergence is rewarded with zero loss cost (correctness defect, high)
 
 `validation.py` returns `losses_kw = NaN` when the power flow diverges; `cost_model.py:69-75`
@@ -313,10 +318,12 @@ things necessary first.
    choice → served energy & load shape → LCOE` therefore has a strong positive feedback: SHS removal
    cuts served energy, a flat LCOE does not fall with scale, so the next pass removes more. Today's
    100 % branch-acceptance rate (§3.1) is that feedback already at its fixed point with a frozen
-   LCOE. The loop needs: (a) an LCOE that genuinely **scales with served energy and load shape** (the
-   whole point of MicroGridsPy in the loop — economies of scale are the only restoring force), (b) a
-   damped/under-relaxed update rather than a naive substitution, and (c) a convergence criterion plus
-   a cycle detector. Expect oscillation between "serve everyone" and "SHS everything" otherwise.
+   LCOE. The loop needs: (a) an LCOE that genuinely **scales with served energy and load shape**,
+   (b) a convergence criterion plus a cycle detector, and (c) optionally a damped update.
+   *Measured since* ([`CONVERGENCE_EXPERIMENT.md`](CONVERGENCE_EXPERIMENT.md)): on Mafa the plain
+   undamped loop converges in 2–3 rounds for every synthetic curve and price tested, with no
+   oscillation; damping only slows it. Scale economies create both a restoring and an opposing force,
+   and the restoring one wins. The earlier "expect oscillation" warning did not hold.
 2. **Fix the marginal-vs-realised gap before iterating** (§3.6), because the loop multiplies it. With
    generation credited exactly, the gate is in principle the true total-NPC break-even; a
    re-solve-after-each-cut (commit only if realised NPC drops) or an ILP over the laminar subtree

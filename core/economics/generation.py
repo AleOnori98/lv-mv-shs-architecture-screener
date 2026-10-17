@@ -82,9 +82,9 @@ class FlatLcoeGeneration:
 
     A proxy for a generation model, not a model: the cost per kWh does not respond to how
     much energy is served or to the shape of the load, so it has **no economies of scale**.
-    That is why it cannot restrain the SHS screen -- as load leaves the grid nothing makes
-    the remaining energy more expensive to generate, so there is no restoring force. See
-    ``docs/PIPELINE_REVIEW.md`` section 3.1.
+    On Mafa this is *not* what drives the SHS screen: synthetic scale-economy curves leave
+    the answer unchanged at the dataset price, which the grid price level relative to the
+    SHS cost per kWh decides. See ``docs/CONVERGENCE_EXPERIMENT.md``.
 
     Separable in customers, so ``present_value`` sums each customer's own growth trajectory
     exactly rather than discounting an aggregate growth rate.

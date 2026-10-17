@@ -157,8 +157,9 @@ them, cut them loose.
 
 > **Known limitation.** On the real case studies this gate accepts **every** candidate branch (17/17
 > in B, 22/22 in D on Mafa, moving 139–153 of 240 customers off-grid). Avoided generation dominates
-> the avoided cost and a flat LCOE has no economies of scale, so nothing restores the balance as load
-> leaves the grid. See [`PIPELINE_REVIEW.md`](PIPELINE_REVIEW.md) §3.1.
+> the avoided cost, and the 0.25 MU/kWh grid price is above SHS_T2's ≈ 0.22 per kWh. Scale economies
+> in generation do not change this at the dataset price; see
+> [`CONVERGENCE_EXPERIMENT.md`](CONVERGENCE_EXPERIMENT.md).
 
 ## Stage 6 — Candidate C (MV/LV service zones) + nested sizing loops
 *`mvlv_service_zones.py` + `_run_mvlv` + `_build_mvlv` + `_voltage_cap_search`*
