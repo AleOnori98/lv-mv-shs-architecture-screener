@@ -11,7 +11,8 @@ import pandas as pd
 
 from core.economics.npc import annuity_factor
 from core.economics import cost_model as cm
-from core.workflow.mvp_runner import _avoided_lv_cost
+from core.io.input_schemas import normalize_cost_parameters
+from core.workflow.mvp_runner import _avoided_lv_cost, build_context
 
 
 def test_annuity_factor_matches_closed_form():
@@ -84,20 +85,19 @@ def test_avoided_lv_cost_includes_service_drops_and_losses():
         "annual_kwh_now": [1000.0, 500.0],
         "growth_rate": [0.0, 0.0],
     })
-    ctx = {
-        "customers": customers,
-        "annual_kwh_by_id": {"C1": 1000.0, "C2": 500.0},
-        "growth_by_id": {"C1": 0.0, "C2": 0.0},
-        "lv_conductors": pd.DataFrame(
-            [
-                {"conductor_id": "small", "rank": 1, "cost_per_m": 2.0},
-                {"conductor_id": "large", "rank": 2, "cost_per_m": 5.0},
-            ]
-        ),
-        "params": params,
-        "T": int(params["planning_horizon_years"]),
-        "discount": float(params["discount_rate"]),
-    }
+    # Built through the pipeline's own context builder: a hand-rolled dict here broke
+    # twice as the pipeline added derived keys.
+    ctx = build_context(
+        customers=customers,
+        params=normalize_cost_parameters(params),
+        lv_conductors=pd.DataFrame([
+            {"conductor_id": "small", "rank": 1, "cost_per_m": 2.0},
+            {"conductor_id": "large", "rank": 2, "cost_per_m": 5.0},
+        ]),
+        packages=pd.DataFrame(columns=["package_id", "service_tier"]),
+        horizon_years=int(params["planning_horizon_years"]),
+        discount_rate=float(params["discount_rate"]),
+    )
 
     expected_base = (
         100.0  # branch cost (internal lines + entry edge)

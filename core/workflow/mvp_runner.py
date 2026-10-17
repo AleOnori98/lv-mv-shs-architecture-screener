@@ -5,7 +5,8 @@ deterministic and logged to ``decision_log`` for traceability.
 """
 from __future__ import annotations
 
-from typing import Any, Callable, Dict, List, Optional
+from dataclasses import replace
+from typing import Any, Callable, Dict, List, NamedTuple, Optional
 
 import pandas as pd
 
@@ -45,31 +46,42 @@ def _log(log: List[Dict[str, Any]], step, candidate, obj, decision, reason, metr
 
 
 def _length_by_line(topology, prefix: str = "") -> Dict[str, float]:
-    out: Dict[str, float] = {}
+    """``line_id -> length_m`` for one topology, optionally namespaced by a zone prefix."""
     if topology is None or topology.edges_4326 is None or topology.edges_4326.empty:
-        return out
-    for _, e in topology.edges_4326.iterrows():
-        out[f"{prefix}{e['line_id']}"] = float(e["length_m"])
-    return out
+        return {}
+    edges = topology.edges_4326
+    return {f"{prefix}{lid}": float(m) for lid, m in zip(edges["line_id"], edges["length_m"])}
 
 
-def _size_flat_lv(topology, customers_df, lv_conductors, constraints, T, coincidence=1.0):
+def _size_flat_lv(ctx, topology):
+    """Size the LV conductors of one topology against the design (horizon) snapshot.
+
+    ``lv_kv`` comes from ``ctx`` like every other snapshot's; it used to be read from
+    ``topology.metadata``, so the sizing build and the snapshots it was validated against
+    could in principle disagree on the voltage level.
+    """
     line_ids = list(_length_by_line(topology).keys())
-    build_fn = lambda cond: build_lv_net(topology, customers_df, cond, lv_kv=topology.metadata.get("lv_kv", 0.4), horizon_years=T, apply_growth=True, coincidence_factor=coincidence)
+    build_fn = lambda cond: build_lv_net(
+        topology, ctx["customers"], cond, lv_kv=ctx["lv_kv"], horizon_years=ctx["T"],
+        apply_growth=True, coincidence_factor=ctx["coincidence"],
+    )
     critical_fn = lambda model, outcome: critical_lv_lines(model, outcome, topology)
-    return size_conductors(line_ids, lv_conductors, build_fn, constraints, critical_fn=critical_fn)
+    return size_conductors(line_ids, ctx["lv_conductors"], build_fn, ctx["constraints"],
+                           critical_fn=critical_fn)
 
 
-def _now_powerflow(topology, customers_df, conductor_by_line, constraints, T, lv_kv, coincidence=1.0):
-    model = build_lv_net(topology, customers_df, conductor_by_line, lv_kv=lv_kv, horizon_years=T, apply_growth=False, coincidence_factor=coincidence)
-    return model, run_powerflow(model, constraints)
+def _lv_powerflow(ctx, topology, conductor_by_line, *, apply_growth: bool, coincidence: float):
+    """Solve one LV snapshot. The three snapshots differ only in these two arguments:
 
-
-def _stress_lv_powerflow(topology, customers_df, conductor_by_line, constraints, T, lv_kv):
-    """Coincident-peak (factor 1.0) stress: every customer at their horizon peak simultaneously,
-    on the network already sized for the diversified design peak."""
-    model = build_lv_net(topology, customers_df, conductor_by_line, lv_kv=lv_kv, horizon_years=T, apply_growth=True, coincidence_factor=1.0)
-    return model, run_powerflow(model, constraints)
+    design   apply_growth=True,  coincidence=ctx["coincidence"]   (gates feasibility)
+    now      apply_growth=False, coincidence=ctx["coincidence"]   (reference)
+    stress   apply_growth=True,  coincidence=1.0                  (every customer at peak)
+    """
+    model = build_lv_net(
+        topology, ctx["customers"], conductor_by_line, lv_kv=ctx["lv_kv"],
+        horizon_years=ctx["T"], apply_growth=apply_growth, coincidence_factor=coincidence,
+    )
+    return model, run_powerflow(model, ctx["constraints"])
 
 
 def build_context(
@@ -105,6 +117,8 @@ def build_context(
             str(c): float(v) for c, v in zip(cid, customers["growth_rate"])
         },
         "coincidence": float(params["coincidence_factor"]),
+        # Catalogue lookups that are invariant for the whole run.
+        "cheapest_lv_cost_per_m": cm.cheapest_lv_cost_per_m(lv_conductors),
         # Diversity basis for transformer sizing / the zone kVA cap; 0 means "track the
         # design coincidence factor" (see transformer_sizing_coincidence_factor).
         "tx_coincidence": (
@@ -160,9 +174,13 @@ def _loss_npc(ctx, losses_kw, grid_ids) -> float:
 
 
 def _service_drop_cost(ctx, total_drop_m: float) -> float:
-    """CAPEX of the service drops, on the same proxy the avoided-cost side credits."""
+    """CAPEX of the service drops, on the same proxy the avoided-cost side credits.
+
+    The cheapest-conductor price is read from the context: this runs once per candidate AND
+    once per screened cluster, and the catalogue does not change during a run.
+    """
     return cm.service_drop_capex(
-        total_drop_m, cm.cheapest_lv_cost_per_m(ctx["lv_conductors"]),
+        total_drop_m, ctx["cheapest_lv_cost_per_m"],
         ctx["params"]["civil_logistics_multiplier"],
     )
 
@@ -171,46 +189,84 @@ def _service_drop_cost(ctx, total_drop_m: float) -> float:
 # Case A — Full LV
 # ---------------------------------------------------------------------------
 
-def _run_full_lv(ctx) -> CaseResult:
-    cid = "A_full_LV"
-    topo = build_lv_topology(ctx["gdf"], ctx["roads"], ctx["crs_meta"], ctx["source"], ctx["eng"])
-    topo.metadata["lv_kv"] = ctx["lv_kv"]
-    _log(ctx["log"], "topology", cid, "full_lv", "generate", "all customers connected (allow_unserved=False)", "n_served", len(topo.served_customer_ids))
+def _assignment(status: str, architecture: str, *, cluster_id: str = "",
+                transformer_id: str = "", package_id: str = "", reason: str = "") -> Dict[str, Any]:
+    """One per-customer assignment row. The six keys are the schema that the customer
+    strategy and tier-service tables index unconditionally, so they live in one place."""
+    return {"status": status, "architecture": architecture, "cluster_id": cluster_id,
+            "transformer_id": transformer_id, "package_id": package_id, "reason": reason}
 
-    sizing = _size_flat_lv(topo, ctx["customers"], ctx["lv_conductors"], ctx["constraints"], ctx["T"], ctx["coincidence"])
+
+def _excluding(ids, excluded) -> List[str]:
+    """``ids`` minus ``excluded``, order preserved, with the exclusion set hoisted."""
+    drop = set(excluded)
+    return [c for c in ids if c not in drop]
+
+
+def _run_flat_lv(ctx, *, cid: str, architecture: str, customer_ids: Optional[List[str]] = None,
+                 sa_customers: Optional[List[str]] = None,
+                 sa_assignments: Optional[Dict[str, Dict[str, Any]]] = None,
+                 sa_npc: float = 0.0, grid_reason: str = "connected to LV grid") -> CaseResult:
+    """Build one flat-LV candidate: topology, conductor sizing, three snapshots, costs.
+
+    Shared by Case A (every customer) and Case B (the stand-alone customers removed and
+    their NPC folded in). These were two copies of the same ~35 lines, and this diff's
+    history shows why that matters: the service-drop component had to be added to both, and
+    anything landing in only one makes the A-vs-B NPC comparison invalid.
+    """
+    sa_customers = list(sa_customers or [])
+    topo = build_lv_topology(ctx["gdf"], ctx["roads"], ctx["crs_meta"], ctx["source"], ctx["eng"],
+                             customer_ids=customer_ids)
+    topo.metadata["lv_kv"] = ctx["lv_kv"]
+
+    sizing = _size_flat_lv(ctx, topo)
     topo.bus_by_pole = sizing.model.bus_by_pole
     _log(ctx["log"], "conductor_sizing", cid, "lv_network", "pass" if sizing.passed else "fail",
          sizing.outcome.active_bottleneck, "iterations", sizing.iterations)
 
-    now_model, now = _now_powerflow(topo, ctx["customers"], sizing.conductor_by_line, ctx["constraints"], ctx["T"], ctx["lv_kv"], ctx["coincidence"])
-    stress_model, stress = _stress_lv_powerflow(topo, ctx["customers"], sizing.conductor_by_line, ctx["constraints"], ctx["T"], ctx["lv_kv"])
+    now_model, now = _lv_powerflow(ctx, topo, sizing.conductor_by_line,
+                                   apply_growth=False, coincidence=ctx["coincidence"])
+    stress_model, stress = _lv_powerflow(ctx, topo, sizing.conductor_by_line,
+                                         apply_growth=True, coincidence=1.0)
 
-    cost = cm.CostBreakdown()
-    cost.lv_line_cost = cm.line_cost(sizing.conductor_by_line, _length_by_line(topo), ctx["params"]["civil_logistics_multiplier"])
-    cost.pole_cost = cm.pole_capex(len(topo.pole_xy), ctx["params"]["pole_cost"], ctx["params"]["civil_logistics_multiplier"])
-    cost.connection_metering_cost = cm.connection_capex(len(topo.served_customer_ids), ctx["params"])
-    drop_total_m = sum(topo.service_drop_m.get(c, 0.0) for c in topo.served_customer_ids)
-    cost.service_drop_cost = _service_drop_cost(ctx, drop_total_m)
-    cost.loss_pv_cost = _loss_npc(ctx, sizing.outcome.losses_kw, topo.served_customer_ids)
-    cost.generation_npc = _generation_npc(ctx, topo.served_customer_ids)
-
-    assign = {c: {"status": "grid_now", "architecture": "Full LV", "cluster_id": "", "transformer_id": "", "package_id": "", "reason": "connected in Full LV"} for c in topo.served_customer_ids}
-
-    res = CaseResult(
-        candidate_id=cid, architecture="Full LV", feasible=sizing.passed, cost=cost,
-        outcome_now=now, outcome_horizon=sizing.outcome, outcome_stress=stress,
-        n_grid_customers=len(topo.served_customer_ids), n_standalone_customers=0,
-        lv_length_m=topo.total_lv_length_m, mv_length_m=0.0,
-        n_poles=len(topo.pole_xy),
-        service_drop_total_m=sum(topo.service_drop_m.get(c, 0.0) for c in topo.served_customer_ids),
-        n_transformers=0,
-        sizing_iterations=sizing.iterations, topology=topo, model_now=now_model, model=sizing.model,
-        model_stress=stress_model,
-        conductor_by_line=sizing.conductor_by_line, grid_customer_ids=list(topo.served_customer_ids),
-        customer_assignment=assign,
-        decision_summary=("Feasible single LV network" if sizing.passed else f"Infeasible: {sizing.outcome.active_bottleneck}"),
+    served = list(topo.served_customer_ids)
+    params = ctx["params"]
+    mult = params["civil_logistics_multiplier"]
+    cost = cm.CostBreakdown(
+        lv_line_cost=cm.line_cost(sizing.conductor_by_line, _length_by_line(topo), mult),
+        pole_cost=cm.pole_capex(len(topo.pole_xy), params["pole_cost"], mult),
+        connection_metering_cost=cm.connection_capex(len(served), params),
+        service_drop_cost=_service_drop_cost(ctx, topo.total_service_drop_m),
+        loss_pv_cost=_loss_npc(ctx, sizing.outcome.losses_kw, served),
+        generation_npc=_generation_npc(ctx, served),
+        standalone_npc=float(sa_npc),
     )
-    ctx["full_lv"] = {"topology": topo, "sizing": sizing}
+
+    assign = {c: _assignment("grid_now", architecture, reason=grid_reason) for c in served}
+    assign.update(sa_assignments or {})
+
+    return CaseResult(
+        candidate_id=cid, architecture=architecture, feasible=sizing.passed, cost=cost,
+        outcome_now=now, outcome_horizon=sizing.outcome, outcome_stress=stress,
+        n_grid_customers=len(served), n_standalone_customers=len(sa_customers),
+        lv_length_m=topo.total_lv_length_m, mv_length_m=0.0, n_transformers=0,
+        n_poles=len(topo.pole_xy), service_drop_total_m=topo.total_service_drop_m,
+        sizing_iterations=sizing.iterations, topology=topo, model_now=now_model,
+        model=sizing.model, model_stress=stress_model,
+        conductor_by_line=sizing.conductor_by_line, grid_customer_ids=served,
+        standalone_customer_ids=sa_customers, standalone_assignments=dict(sa_assignments or {}),
+        customer_assignment=assign,
+    )
+
+
+def _run_full_lv(ctx) -> CaseResult:
+    """Case A: every customer on one flat LV network."""
+    res = _run_flat_lv(ctx, cid="A_full_LV", architecture="Full LV",
+                       grid_reason="connected in Full LV")
+    _log(ctx["log"], "topology", "A_full_LV", "full_lv", "generate",
+         "all customers connected (allow_unserved=False)", "n_served", res.n_grid_customers)
+    res.decision_summary = ("Feasible single LV network" if res.feasible
+                            else f"Infeasible: {res.outcome_horizon.active_bottleneck}")
     return res
 
 
@@ -257,7 +313,20 @@ def _avoided_mvlv_subtree_cost(cluster: Cluster, ctx) -> float:
     return _avoided_grid_cost(cluster, ctx, include_losses=False)
 
 
-def _select_standalone_clusters(ctx, clusters, avoided_cost_fn, architecture_label, cid):
+class StandaloneSelection(NamedTuple):
+    """What one SHS screen decided: the customers, their assignments and their total NPC.
+
+    A named value rather than a bare 3-tuple because it was threaded through four
+    signatures in two different orders, and both call sites star-unpacked it -- so
+    reordering the tuple would have bound an assignments dict into the NPC slot silently.
+    """
+
+    customer_ids: List[str]
+    assignments: Dict[str, Dict[str, Any]]
+    npc: float
+
+
+def _select_standalone_clusters(ctx, clusters, avoided_cost_fn, architecture_label, cid) -> StandaloneSelection:
     """Screen candidate subtrees and pick stand-alone where SHS NPC < avoided grid cost.
 
     Shared by the LV screen (Case B) and the MV/LV screen (Case D). Each candidate exposes
@@ -278,10 +347,11 @@ def _select_standalone_clusters(ctx, clusters, avoided_cost_fn, architecture_lab
     claimed: set = set()
     assignments: Dict[str, Dict[str, Any]] = {}
     npc_total = 0.0
-    avoided_by = {id(cl): avoided_cost_fn(cl, ctx) for cl in clusters}
-    for cl in sorted(clusters, key=lambda c: avoided_by[id(c)], reverse=True):
-        if not cl.standalone_eligible_precheck:
-            continue
+    # Only eligible candidates can be selected, and the ordering only matters among those,
+    # so ineligible ones are not priced at all.
+    eligible = [cl for cl in clusters if cl.standalone_eligible_precheck]
+    avoided_by = {id(cl): avoided_cost_fn(cl, ctx) for cl in eligible}
+    for cl in sorted(eligible, key=lambda c: avoided_by[id(c)], reverse=True):
         if any(c in claimed for c in cl.customer_ids):  # a coarser subtree already took these
             continue
         sa = cluster_standalone(
@@ -302,70 +372,34 @@ def _select_standalone_clusters(ctx, clusters, avoided_cost_fn, architecture_lab
             selected.extend(cl.customer_ids)
             claimed.update(cl.customer_ids)
             for ch in sa["choices"]:
-                assignments[ch.customer_id] = {
-                    "status": "standalone", "architecture": architecture_label, "cluster_id": cl.cluster_id,
-                    "transformer_id": "", "package_id": ch.package_id, "reason": "stand-alone NPC < avoided grid cost",
-                }
+                assignments[ch.customer_id] = _assignment(
+                    "standalone", architecture_label, cluster_id=cl.cluster_id,
+                    package_id=ch.package_id, reason="stand-alone NPC < avoided grid cost",
+                )
             npc_total += sa["total_npc"]
-    return selected, assignments, npc_total
+    return StandaloneSelection(selected, assignments, npc_total)
 
 
-def _run_lv_standalone(ctx, full_res: CaseResult, sa_customers, sa_assignments, sa_npc_total) -> CaseResult:
+def _run_lv_standalone(ctx, full_res: CaseResult, selection: "StandaloneSelection") -> CaseResult:
+    """Case B: the LV screen's stand-alone customers removed, the LV grid rebuilt on the rest."""
     cid = "B_LV_plus_standalone"
-    T = ctx["T"]
-    selected_sa_customers = list(sa_customers)
-    grid_ids = [c for c in full_res.grid_customer_ids if c not in set(selected_sa_customers)]
-
-    if not selected_sa_customers:
-        # No stand-alone selected: identical to Full LV (still a valid candidate).
-        res = CaseResult(
-            candidate_id=cid, architecture="LV + Stand-alone", feasible=full_res.feasible, cost=full_res.cost,
-            outcome_now=full_res.outcome_now, outcome_horizon=full_res.outcome_horizon, outcome_stress=full_res.outcome_stress,
-            n_grid_customers=full_res.n_grid_customers, n_standalone_customers=0,
-            lv_length_m=full_res.lv_length_m,
-            n_poles=full_res.n_poles, service_drop_total_m=full_res.service_drop_total_m,
-            sizing_iterations=full_res.sizing_iterations, topology=full_res.topology,
-            model_now=full_res.model_now, model=full_res.model, model_stress=full_res.model_stress,
-            conductor_by_line=full_res.conductor_by_line, grid_customer_ids=list(grid_ids),
-            customer_assignment=dict(full_res.customer_assignment),
-            decision_summary="No cluster cheaper as stand-alone; equals Full LV",
-        )
+    if not selection.customer_ids:
+        # Nothing was cheaper off-grid: B is Case A, re-labelled. Still a valid candidate.
+        res = replace(full_res, candidate_id=cid, architecture="LV + Stand-alone",
+                      decision_summary="No cluster cheaper as stand-alone; equals Full LV")
+        res.customer_assignment = dict(full_res.customer_assignment)
         return res
 
-    topo = build_lv_topology(ctx["gdf"], ctx["roads"], ctx["crs_meta"], ctx["source"], ctx["eng"], customer_ids=grid_ids)
-    topo.metadata["lv_kv"] = ctx["lv_kv"]
-    sizing = _size_flat_lv(topo, ctx["customers"], ctx["lv_conductors"], ctx["constraints"], T, ctx["coincidence"])
-    topo.bus_by_pole = sizing.model.bus_by_pole
-    now_model, now = _now_powerflow(topo, ctx["customers"], sizing.conductor_by_line, ctx["constraints"], T, ctx["lv_kv"], ctx["coincidence"])
-    stress_model, stress = _stress_lv_powerflow(topo, ctx["customers"], sizing.conductor_by_line, ctx["constraints"], T, ctx["lv_kv"])
-
-    cost = cm.CostBreakdown()
-    cost.lv_line_cost = cm.line_cost(sizing.conductor_by_line, _length_by_line(topo), ctx["params"]["civil_logistics_multiplier"])
-    cost.pole_cost = cm.pole_capex(len(topo.pole_xy), ctx["params"]["pole_cost"], ctx["params"]["civil_logistics_multiplier"])
-    cost.connection_metering_cost = cm.connection_capex(len(topo.served_customer_ids), ctx["params"])
-    drop_total_m = sum(topo.service_drop_m.get(c, 0.0) for c in topo.served_customer_ids)
-    cost.service_drop_cost = _service_drop_cost(ctx, drop_total_m)
-    cost.loss_pv_cost = _loss_npc(ctx, sizing.outcome.losses_kw, topo.served_customer_ids)
-    cost.generation_npc = _generation_npc(ctx, topo.served_customer_ids)
-    cost.standalone_npc = sa_npc_total
-
-    assign = {c: {"status": "grid_now", "architecture": "LV + Stand-alone", "cluster_id": "", "transformer_id": "", "package_id": "", "reason": "connected to LV grid"} for c in topo.served_customer_ids}
-    assign.update(sa_assignments)
-
-    return CaseResult(
-        candidate_id=cid, architecture="LV + Stand-alone", feasible=sizing.passed, cost=cost,
-        outcome_now=now, outcome_horizon=sizing.outcome, outcome_stress=stress,
-        n_grid_customers=len(topo.served_customer_ids), n_standalone_customers=len(selected_sa_customers),
-        lv_length_m=topo.total_lv_length_m,
-        n_poles=len(topo.pole_xy),
-        service_drop_total_m=sum(topo.service_drop_m.get(c, 0.0) for c in topo.served_customer_ids),
-        sizing_iterations=sizing.iterations, topology=topo, model_now=now_model, model=sizing.model,
-        model_stress=stress_model,
-        conductor_by_line=sizing.conductor_by_line, grid_customer_ids=list(topo.served_customer_ids),
-        standalone_customer_ids=list(selected_sa_customers), standalone_assignments=sa_assignments,
-        customer_assignment=assign,
-        decision_summary=f"{len(selected_sa_customers)} customers moved to stand-alone; LV grid resized",
+    grid_ids = _excluding(full_res.grid_customer_ids, selection.customer_ids)
+    res = _run_flat_lv(
+        ctx, cid=cid, architecture="LV + Stand-alone", customer_ids=grid_ids,
+        sa_customers=selection.customer_ids, sa_assignments=selection.assignments,
+        sa_npc=selection.npc,
     )
+    res.decision_summary = (
+        f"{len(selection.customer_ids)} customers moved to stand-alone; LV grid resized"
+    )
+    return res
 
 
 # ---------------------------------------------------------------------------
@@ -452,7 +486,7 @@ def _build_mvlv_at(ctx, groups: List[List[str]], stepup_spec: Dict[str, Any],
         cache_key = frozenset(zone["customer_ids"])
         cached = sizing_cache.get(cache_key)
         if cached is None:
-            zsizing = _size_flat_lv(ztopo, ctx["customers"], ctx["lv_conductors"], constraints, T, ctx["coincidence"])
+            zsizing = _size_flat_lv(ctx, ztopo)
             cached = {"conductors": dict(zsizing.conductor_by_line),
                       "bus_by_pole": dict(zsizing.model.bus_by_pole)}
             sizing_cache[cache_key] = cached
@@ -787,7 +821,6 @@ def _run_mvlv(ctx, grid_ids: List[str], *, cid: str = "C_MVLV", architecture: st
     removed first, then the remainder MV/LV-zoned). Pass the stand-alone NPC/customers/assignments
     to fold them into the candidate.
     """
-    T = ctx["T"]
     sa_customers = list(sa_customers or [])
     sa_assignments = dict(sa_assignments or {})
     grid_ids = list(grid_ids)
@@ -855,10 +888,7 @@ def _run_mvlv(ctx, grid_ids: List[str], *, cid: str = "C_MVLV", architecture: st
     n_poles = sum(len(z["topology"].pole_xy) for z in plan.zones)
     cost.pole_cost = cm.pole_capex(n_poles, ctx["params"]["pole_cost"], ctx["params"]["civil_logistics_multiplier"])
     cost.transformer_cost = cm.transformer_capex(transformers_chosen + [stepup])
-    service_drop_total = sum(
-        float(z["topology"].service_drop_m.get(c, 0.0))
-        for z in plan.zones for c in z["topology"].served_customer_ids
-    )
+    service_drop_total = sum(z["topology"].total_service_drop_m for z in plan.zones)
     grid_served_ids = [c for z in plan.zones for c in z["topology"].served_customer_ids]
     n_grid = len(grid_served_ids)
     cost.connection_metering_cost = cm.connection_capex(n_grid, ctx["params"])
@@ -870,8 +900,9 @@ def _run_mvlv(ctx, grid_ids: List[str], *, cid: str = "C_MVLV", architecture: st
     assign: Dict[str, Dict[str, Any]] = {}
     for zone in plan.zones:
         for c in zone["topology"].served_customer_ids:
-            assign[c] = {"status": "grid_now", "architecture": architecture, "cluster_id": zone["zone_id"],
-                         "transformer_id": zone["transformer_id"], "package_id": "", "reason": "MV/LV service zone"}
+            assign[c] = _assignment("grid_now", architecture, cluster_id=zone["zone_id"],
+                                    transformer_id=zone["transformer_id"],
+                                    reason="MV/LV service zone")
     assign.update(sa_assignments)
 
     return CaseResult(
@@ -882,7 +913,7 @@ def _run_mvlv(ctx, grid_ids: List[str], *, cid: str = "C_MVLV", architecture: st
         n_poles=n_poles, service_drop_total_m=service_drop_total, n_transformers=len(transformers_chosen),
         topology=None, plan=plan, model_now=now_model, model=final_model, model_stress=stress_model,
         conductor_by_line=zone_cond,
-        grid_customer_ids=[c for c in assign.keys() if c not in set(sa_customers)],
+        grid_customer_ids=list(grid_served_ids),
         standalone_customer_ids=list(sa_customers), standalone_assignments=sa_assignments,
         customer_assignment=assign, transformers=transformers_chosen,
         decision_summary=(
@@ -904,7 +935,7 @@ def detect_mvlv_subtree_candidates(mvlv_res: CaseResult, ctx) -> List[Cluster]:
     plan = getattr(mvlv_res, "plan", None)
     if plan is None or not getattr(plan, "zones", None):
         return []
-    largest_lv_id = str(ctx["lv_conductors"].sort_values("rank").iloc[-1]["conductor_id"])
+    largest_lv_id = cm.largest_lv_conductor_id(ctx["lv_conductors"])
     zone_cond_all = mvlv_res.conductor_by_line or {}
 
     candidates: List[Cluster] = []
@@ -920,22 +951,20 @@ def detect_mvlv_subtree_candidates(mvlv_res: CaseResult, ctx) -> List[Cluster]:
     return candidates
 
 
-def _run_mvlv_standalone(ctx, full_res: CaseResult, sa_customers, sa_assignments, sa_npc) -> CaseResult:
+def _run_mvlv_standalone(ctx, full_res: CaseResult, selection: StandaloneSelection) -> CaseResult:
     """Case D: apply the MV/LV-specific subtree stand-alone screen, then rebuild MV/LV over the rest.
 
     The stand-alone set comes from :func:`detect_mvlv_subtree_candidates` (per-zone terminal
     subtrees), not from Case B's LV screen, so D never reuses B's SHS customers.
     """
     cid = "D_MVLV_plus_standalone"
-    sa_customers = list(sa_customers)
-    sa_set = set(sa_customers)
-    grid_ids = [c for c in full_res.grid_customer_ids if c not in sa_set]
-
     res = _run_mvlv(
-        ctx, grid_ids, cid=cid, architecture="MV/LV + Stand-alone",
-        sa_npc=float(sa_npc), sa_customers=sa_customers, sa_assignments=dict(sa_assignments),
+        ctx, _excluding(full_res.grid_customer_ids, selection.customer_ids),
+        cid=cid, architecture="MV/LV + Stand-alone",
+        sa_npc=selection.npc, sa_customers=selection.customer_ids,
+        sa_assignments=selection.assignments,
     )
-    if not sa_customers:
+    if not selection.customer_ids:
         res.decision_summary += "; no stand-alone zone selected"
     return res
 
@@ -1067,15 +1096,15 @@ def _tier_service_table(cases: Dict[str, CaseResult], customers_df, packages) ->
 
 
 def _cost_row(res: CaseResult) -> Dict[str, Any]:
+    """One row per candidate, one column per cost component.
+
+    Keyed off ``cm.COMPONENTS`` so a component added to ``CostBreakdown`` reaches this
+    table automatically; it used to be a hand-written list that had to be edited in step.
+    """
     c = res.cost
     return {
         "candidate_id": res.candidate_id,
-        "lv_line_cost": round(c.lv_line_cost, 0), "mv_line_cost": round(c.mv_line_cost, 0),
-        "pole_cost": round(c.pole_cost, 0), "transformer_cost": round(c.transformer_cost, 0),
-        "connection_metering_cost": round(c.connection_metering_cost, 0),
-        "service_drop_cost": round(c.service_drop_cost, 0),
-        "standalone_npc": round(c.standalone_npc, 0), "loss_pv_cost": round(c.loss_pv_cost, 0),
-        "generation_npc": round(c.generation_npc, 0),
+        **{name: round(float(getattr(c, name)), 0) for name in cm.COMPONENTS},
         "total_npc": round(c.total_npc, 0),
         "npc_complete": c.npc_complete,
     }
@@ -1138,9 +1167,9 @@ def run_simplified_mvp(
 
     # Case B: LV screen over the terminal subtrees (leaf branches) of the Full-LV tree.
     emit("Generating Full-LV terminal subtrees (leaf branches)...")
-    largest_lv_id = str(lv_conductors.sort_values("rank").iloc[-1]["conductor_id"])
+    largest_lv_id = cm.largest_lv_conductor_id(lv_conductors)
     lv_clusters = detect_lv_subtrees(
-        ctx["full_lv"]["topology"], customers, conductor_by_line=full_res.conductor_by_line,
+        full_res.topology, customers, conductor_by_line=full_res.conductor_by_line,
         full_model=full_res.model, cost_params=params, horizon_years=T, largest_conductor_id=largest_lv_id,
     )
     for cl in lv_clusters:
@@ -1150,7 +1179,7 @@ def run_simplified_mvp(
 
     emit("Building LV + stand-alone case (LV leaf-branch SHS screen)...")
     lv_sa = _select_standalone_clusters(ctx, lv_clusters, _avoided_lv_cost, "LV + Stand-alone", "B_LV_plus_standalone")
-    sa_res = _run_lv_standalone(ctx, full_res, *lv_sa)
+    sa_res = _run_lv_standalone(ctx, full_res, lv_sa)
 
     # Case D: MV/LV screen over the terminal subtrees inside each zone's LV tree (own SHS set, not B's).
     emit("Building MV/LV + stand-alone case (per-zone leaf-branch SHS screen)...")
@@ -1160,7 +1189,7 @@ def run_simplified_mvp(
              "flagged" if cl.is_problematic else "clean", "; ".join(cl.reasons) or "within limits",
              "n_customers", cl.n_customers)
     mvlv_sa = _select_standalone_clusters(ctx, mvlv_clusters, _avoided_mvlv_subtree_cost, "MV/LV + Stand-alone", "D_MVLV_plus_standalone")
-    mvlv_sa_res = _run_mvlv_standalone(ctx, full_res, *mvlv_sa)
+    mvlv_sa_res = _run_mvlv_standalone(ctx, full_res, mvlv_sa)
 
     cases = {
         "A_full_LV": full_res,

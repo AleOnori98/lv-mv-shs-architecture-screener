@@ -40,7 +40,17 @@ class LVTopology:
 
     @property
     def total_lv_length_m(self) -> float:
+        """Total backbone length [m] (excludes service drops, which carry no impedance)."""
         return float(self.edges_4326["length_m"].sum()) if not self.edges_4326.empty else 0.0
+
+    @property
+    def total_service_drop_m(self) -> float:
+        """Total pole-to-customer drop length [m] over the served customers.
+
+        A property so the metres that are CHARGED and the metres that are REPORTED are the
+        same expression; they were written out six times, twice within one function.
+        """
+        return float(sum(self.service_drop_m.get(c, 0.0) for c in self.served_customer_ids))
 
 
 def build_lv_topology(

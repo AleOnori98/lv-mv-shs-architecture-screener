@@ -1,6 +1,7 @@
 """CAPEX and present-value-of-losses costing for a candidate architecture."""
 from __future__ import annotations
 
+import dataclasses
 import math
 from dataclasses import dataclass
 from typing import Any, Dict, List
@@ -20,11 +21,9 @@ class CostBreakdown:
     loss_pv_cost: float = 0.0
     generation_npc: float = 0.0
 
-    _COMPONENTS = (
-        "lv_line_cost", "mv_line_cost", "pole_cost", "transformer_cost",
-        "connection_metering_cost", "service_drop_cost",
-        "standalone_npc", "loss_pv_cost", "generation_npc",
-    )
+    # Derived from the fields, so a new cost field cannot be silently excluded from
+    # total_npc and missing_components. _CAPEX_COMPONENTS stays explicit: it is a real
+    # subset (the up-front spend), not every field.
     _CAPEX_COMPONENTS = (
         "lv_line_cost", "mv_line_cost", "pole_cost", "transformer_cost",
         "connection_metering_cost", "service_drop_cost",
@@ -57,6 +56,13 @@ class CostBreakdown:
         """Sum of the KNOWN components. Check ``npc_complete`` before comparing two totals:
         an incomplete total is a lower bound, never a like-for-like cost."""
         return self._sum(self._COMPONENTS)
+
+
+# Every cost component of a candidate, in reporting order. Public so the tables, charts
+# and figure scripts key off one list instead of hand-copying it (adding service_drop_cost
+# previously took four separate edits, and a missed one silently drops it from a chart).
+COMPONENTS: tuple = tuple(f.name for f in dataclasses.fields(CostBreakdown))
+CostBreakdown._COMPONENTS = COMPONENTS
 
 
 def line_cost(conductor_by_line: Dict[str, Dict[str, Any]], length_by_line: Dict[str, float], civil_multiplier: float) -> float:
@@ -93,6 +99,15 @@ def service_drop_capex(total_drop_m: float, cheapest_lv_cost_per_m: float, civil
 def cheapest_lv_cost_per_m(lv_conductors) -> float:
     """``cost_per_m`` of the lowest-rank (cheapest) LV conductor in the catalogue."""
     return float(lv_conductors.sort_values("rank").iloc[0]["cost_per_m"])
+
+
+def largest_lv_conductor_id(lv_conductors) -> str:
+    """``conductor_id`` of the highest-rank (largest) LV conductor in the catalogue.
+
+    Here beside its cheapest-first mirror so the "rank ascending = cheapest first"
+    convention is asserted in one place rather than spelled out at each call site.
+    """
+    return str(lv_conductors.sort_values("rank").iloc[-1]["conductor_id"])
 
 
 def transformer_capex(transformers: list[Dict[str, Any]]) -> float:
