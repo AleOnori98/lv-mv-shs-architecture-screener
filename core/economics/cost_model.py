@@ -117,36 +117,6 @@ def transformer_capex(transformers: list[Dict[str, Any]]) -> float:
     return total
 
 
-def generation_present_value(
-    annual_kwh_total: float,
-    cost_params: Dict[str, float],
-    *,
-    growth_rate: float = 0.0,
-) -> float:
-    """PV of the mini-grid generation cost for grid-served energy over the planning horizon.
-
-    ``annual_kwh_total`` is the grid-served annual energy TODAY (sum of ``annual_kwh_now``
-    over grid customers); ``growth_rate`` is the energy-weighted annual growth of that same
-    set. The stream is levelised at ``generation_lcoe_per_kwh`` over its actual growth
-    trajectory (:func:`~core.economics.npc.growth_annuity_factor`).
-
-    Stand-alone customers are excluded -- their generation cost is already inside the SHS
-    package NPC -- so grid and stand-alone are compared on the same footing.
-
-    Previously this held present-year energy flat for the whole horizon while the loss cost
-    was taken from the HORIZON power flow, also held flat: two different years of the same
-    growing demand added into one NPC. Both now use the same growth-aware discounting.
-    """
-    lcoe = float(cost_params.get("generation_lcoe_per_kwh", 0.0) or 0.0)
-    kwh = float(annual_kwh_total or 0.0)
-    if lcoe <= 0.0 or kwh <= 0.0:
-        return 0.0
-    return lcoe * kwh * growth_annuity_factor(
-        float(cost_params["discount_rate"]), float(growth_rate),
-        int(cost_params["planning_horizon_years"]),
-    )
-
-
 def loss_energy_price(cost_params: Dict[str, float]) -> float:
     """Price of one kWh of loss energy.
 

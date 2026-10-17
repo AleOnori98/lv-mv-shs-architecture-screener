@@ -11,6 +11,7 @@ import pandas as pd
 
 from core.economics.npc import annuity_factor
 from core.economics import cost_model as cm
+from core.economics.generation import ServedEnergy, model_from_parameters
 from core.io.input_schemas import normalize_cost_parameters
 from core.workflow.mvp_runner import _avoided_lv_cost, build_context
 
@@ -32,14 +33,24 @@ def test_cost_breakdown_totals():
     assert c.total_npc == c.grid_capex + 600 + 250 + 1500
 
 
+def _gen_pv(annual_kwh, params, growth_rate=0.0):
+    """Generation PV through the seam -- the one implementation production uses."""
+    model = model_from_parameters(params)
+    served = ServedEnergy(annual_kwh=float(annual_kwh), growth_rate=float(growth_rate))
+    return model.present_value(
+        served, horizon_years=int(params["planning_horizon_years"]),
+        discount_rate=float(params["discount_rate"]),
+    )
+
+
 def test_generation_present_value_levelises_grid_energy():
     params = {"generation_lcoe_per_kwh": 0.25, "discount_rate": 0.10, "planning_horizon_years": 10}
     # 10,000 kWh/yr levelised at 0.25 EUR/kWh over the horizon annuity.
     expected = 0.25 * 10000.0 * annuity_factor(0.10, 10)
-    assert abs(cm.generation_present_value(10000.0, params) - expected) < 1e-6
+    assert abs(_gen_pv(10000.0, params) - expected) < 1e-6
     # Disabled (zero LCOE) or no grid energy -> no generation cost.
-    assert cm.generation_present_value(10000.0, {**params, "generation_lcoe_per_kwh": 0.0}) == 0.0
-    assert cm.generation_present_value(0.0, params) == 0.0
+    assert _gen_pv(10000.0, {**params, 'generation_lcoe_per_kwh': 0.0}) == 0.0
+    assert _gen_pv(0.0, params) == 0.0
 
 
 def test_line_cost_uses_length_and_civil_multiplier():
@@ -104,7 +115,7 @@ def test_avoided_lv_cost_includes_service_drops_and_losses():
         + 30.0 * 2.0 * 1.2  # service drops with cheapest LV conductor
         + 2 * (100.0 + 50.0)  # connection and metering
         + 3 * 120.0 * 1.2  # all subtree poles avoided
-        + cm.generation_present_value(1500.0, params)  # avoided grid generation for C1 + C2
+        + _gen_pv(1500.0, params)  # avoided grid generation for C1 + C2
     )
     expected = expected_base + cm.loss_present_value(1.0, params)
 
@@ -149,12 +160,12 @@ def test_growth_consistent_energy_costs():
               "loss_value_per_kwh": 0.0}
 
     # No growth => the growth annuity collapses to the plain annuity (old behaviour).
-    flat = cm.generation_present_value(1000.0, params, growth_rate=0.0)
+    flat = _gen_pv(1000.0, params, 0.0)
     assert flat == pytest.approx(0.25 * 1000.0 * annuity_factor(0.10, 15))
 
     # With growth the stream is worth more than flat-at-present but far less than
     # flat-at-horizon, which is what the two inconsistent bases bracketed.
-    grown = cm.generation_present_value(1000.0, params, growth_rate=0.04)
+    grown = _gen_pv(1000.0, params, 0.04)
     flat_at_horizon = 0.25 * 1000.0 * annuity_factor(0.10, 15) * 1.04 ** 15
     assert flat < grown < flat_at_horizon
     assert grown == pytest.approx(0.25 * 1000.0 * growth_annuity_factor(0.10, 0.04, 15))
