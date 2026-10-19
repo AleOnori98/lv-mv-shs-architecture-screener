@@ -1,0 +1,18 @@
+# Python byte-code and caches
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+
+# Editor crash / temp artefacts (see docs/INTEGRATION_FEASIBILITY.md step 0.1)
+*.py.tmp.*
+~$*
+
+# Environments
+.venv/
+venv/
+env/
+
+# Run outputs
+outputs/*
+!outputs/.gitkeep
